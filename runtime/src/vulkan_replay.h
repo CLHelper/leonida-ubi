@@ -733,7 +733,18 @@ struct QueryPool {
     // the statistics query of the same index in `pool` (which counts 13 statistics: the 11 classic ones, then task
     // and mesh shader invocations). It supplies MSPrimitives, the last field of D3D12_QUERY_DATA_PIPELINE_STATISTICS1.
     VkQueryPool primitives = VK_NULL_HANDLE;
+    // Pipeline-statistics heaps: the kinds of draw each ended query saw (query_draw_kinds bits), sized on first use.
+    std::vector<std::uint8_t> draw_kinds;
 };
+
+// The draws a pipeline-statistics query saw between its BeginQuery and EndQuery (D3D12 requires both in one list).
+// Vulkan drivers count pipeline stages that D3D12 does not (D3D-339, measured on NVIDIA): a mesh draw adds to
+// IAVertices, IAPrimitives and VSInvocations, and a vertex draw adds its triangles to MESH_PRIMITIVES_GENERATED.
+// D3D12 reports 0 there. A query that saw one kind only has those counters zeroed at resolve.
+namespace query_draw_kinds {
+inline constexpr std::uint8_t vertex = 1;  // DrawInstanced, DrawIndexedInstanced, ExecuteIndirect draws
+inline constexpr std::uint8_t mesh = 2;    // DispatchMesh
+}  // namespace query_draw_kinds
 
 // The Vulkan statistics a D3D12 pipeline-statistics query counts. VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT
 // through COMPUTE_SHADER_INVOCATIONS_BIT (0x1-0x400) are, in bit order (the order Vulkan writes results in), the
@@ -913,6 +924,8 @@ struct QueryResolveRun {
     // the counters each of its segments holds.
     std::uint32_t query = 0;
     std::uint32_t segment_counters = 0;
+    // The draws every query of the run saw (query_draw_kinds); runs only merge queries with the same kinds.
+    std::uint8_t draw_kinds = 0;
 };
 
 struct PreparedQuery {
@@ -930,6 +943,8 @@ struct PreparedQuery {
     std::uint32_t statistics_begin = no_segment;
     std::uint32_t statistics_first = 0;
     std::uint32_t statistics_count = 0;
+    // A pipeline-statistics EndQuery: the draws since its BeginQuery (query_draw_kinds).
+    std::uint8_t draw_kinds = 0;
     std::vector<QueryResolveRun> resolves;
 };
 
@@ -2163,6 +2178,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     // Vulkan allows one active query per type. Only ordinary occlusion uses virtual segments.
     std::size_t ordinary_active = 0;
     bool overlaps = false, binary_active = false, statistics_active = false;
+    std::uint8_t statistics_draws = 0;  // query_draw_kinds since the active statistics query began
     out.wrote_readback = false;
     out.readback_src_stages = 0;
 
@@ -2499,6 +2515,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 } else {
                     if (begin && statistics_active) return ReplayResult::unsupported;
                     statistics_active = begin;
+                    if (begin) statistics_draws = 0;
                 }
             }
             if (const auto* resolve_queries = std::get_if<ResolveQueries>(&command)) {
@@ -2520,7 +2537,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 }
             }
             out.queries.push_back({i, heap, statistics_active});
+            if (is_pipeline_statistics(range.type) && std::holds_alternative<EndQuery>(command))
+                out.queries.back().draw_kinds = statistics_draws;
         } else if (const auto* ind = std::get_if<ExecuteIndirect>(&command)) {
+            if (statistics_active && ind->kind != IndirectKind::dispatch) statistics_draws |= query_draw_kinds::vertex;
             if (!bind(ind->argument_buffer) || !p.binding.buffer) return ReplayResult::unresolved_resource;
             const VkDeviceSize record_size = detail::indirect_record_size(ind->kind);
             if (!record_size || ind->stride < record_size || ind->stride % sizeof(std::uint32_t))
@@ -2596,6 +2616,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             p.pipeline = *pipeline;
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
             if (const auto r = detail::prepare_draw(*draw, resolve, vk, p); r != ReplayResult::success) return r;
+            if (statistics_active) statistics_draws |= draw->mesh ? query_draw_kinds::mesh : query_draw_kinds::vertex;
         }
     }
     if (ordinary_active) return ReplayResult::invalid_query;
@@ -2645,7 +2666,7 @@ public:
             if (const auto* begin = std::get_if<BeginQuery>(&command)) {
                 pending_[{query.heap, begin->index}] = {};
             } else if (const auto* end = std::get_if<EndQuery>(&command)) {
-                Value result{true, {}};
+                Value result{true, {}, query.draw_kinds};
                 if (query.result_count) result.occlusion = {pool, base + query.first_result, query.result_count};
                 if (query.statistics_count)
                     result.occlusion = {statistics_pool, statistics_base + query.statistics_first,
@@ -2668,6 +2689,7 @@ public:
                     needs_binary |= binary && value.ended;
                     detail::QueryResolveRun run{value.ended ? query.heap->pool : VK_NULL_HANDLE,
                                                 index, 1, offset + VkDeviceSize(i) * size, false, index};
+                    run.draw_kinds = statistics && value.ended ? value.draw_kinds : 0;
                     if (value.occlusion.segments) {
                         if (resolve.type != d3d12_query::occlusion && !statistics) return ReplayResult::invalid_query;
                         const auto& saved = value.occlusion;
@@ -2678,14 +2700,15 @@ public:
                         if (statistics && saved.segments->counters < counters) return ReplayResult::unsupported;
                         const bool sum = saved.count > 1 || (statistics && saved.segments->counters != counters);
                         run = {saved.segments->pool, saved.first, saved.count, run.offset, sum,
-                               index,                saved.segments->counters};
+                               index,                saved.segments->counters, run.draw_kinds};
                         if (!can_sum || (run.sum && !uncounted)) return ReplayResult::unsupported;
                         (statistics ? needs_statistics_sum : needs_sum) |= run.sum;
                         retain(saved.segments);
                     }
                     if (!query.resolves.empty() && !run.sum && run.count == 1) {
                         auto& last = query.resolves.back();
-                        if (!last.sum && last.pool == run.pool && last.first + last.count == run.first) {
+                        if (!last.sum && last.pool == run.pool && last.first + last.count == run.first &&
+                            last.draw_kinds == run.draw_kinds) {
                             ++last.count;
                             continue;
                         }
@@ -2703,6 +2726,8 @@ public:
             heap->ended[index] = result.ended;
             if (result.occlusion.segments) heap->occlusion[index] = std::move(result.occlusion);
             else heap->occlusion.erase(index);
+            if (heap->draw_kinds.size() < heap->count) heap->draw_kinds.resize(heap->count, 0);
+            if (index < heap->draw_kinds.size()) heap->draw_kinds[index] = result.draw_kinds;
         }
     }
 
@@ -2715,12 +2740,14 @@ private:
     struct Value {
         bool ended = false;
         OcclusionResult occlusion;
+        std::uint8_t draw_kinds = 0;  // pipeline statistics: the draws the query saw (query_draw_kinds)
     };
 
     Value lookup(QueryPool& heap, std::uint32_t index) const {
         if (const auto it = pending_.find({&heap, index}); it != pending_.end()) return it->second;
-        if (const auto it = heap.occlusion.find(index); it != heap.occlusion.end()) return {true, it->second};
-        return {heap.ended[index], {}};
+        const std::uint8_t kinds = index < heap.draw_kinds.size() ? heap.draw_kinds[index] : 0;
+        if (const auto it = heap.occlusion.find(index); it != heap.occlusion.end()) return {true, it->second, kinds};
+        return {heap.ended[index], {}, kinds};
     }
 
     void retain(const std::shared_ptr<const OcclusionSegmentPool>& pool) {
@@ -2795,6 +2822,26 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
         // queries) is suppressed inside an active conditional rendering scope after PredicateReducer::capture's
         // compute dispatch (D3D-148).
         const bool suspend = predicate.buffer && !query.resolves.empty();
+        // D3D-339: a statistics query that saw one kind of draw gets 0 in the counters Vulkan fills for the other
+        // kind and D3D12 does not: IAVertices, IAPrimitives and VSInvocations (the first three UINT64s) after mesh
+        // draws, MSPrimitives (PIPELINE_STATISTICS1's 14th) after vertex draws. A query that saw both keeps the
+        // driver's counts (splitting it per pipeline kind is still open). Runs after the copy or sum, so it waits
+        // for their writes.
+        const auto zero_other_draw_kind = [&](const detail::QueryResolveRun& run) {
+            if (!statistics || !vk.pipeline_barrier) return;
+            const bool mesh = run.draw_kinds == query_draw_kinds::mesh;
+            const bool vertex = run.draw_kinds == query_draw_kinds::vertex;
+            if (!mesh && !(vertex && resolve.type == d3d12_query::pipeline_statistics1)) return;
+            const VkDeviceSize at = mesh ? 0 : VkDeviceSize(counters) * 8;
+            const VkDeviceSize bytes = mesh ? 3 * 8 : 8;
+            const VkMemoryBarrier written{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                          VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                          VK_ACCESS_TRANSFER_WRITE_BIT};
+            vk.pipeline_barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &written, 0, nullptr, 0, nullptr);
+            for (std::uint32_t q = 0; q < (run.sum ? 1u : run.count); ++q)
+                vk.fill_buffer(cb, dst, run.offset + VkDeviceSize(q) * size + at, bytes, 0);
+        };
         end_statistics();
         if (suspend) vk.end_conditional_rendering(cb);
         for (const auto& run : query.resolves) {
@@ -2818,6 +2865,7 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
                 vk.copy_query_pool_results(cb, heap.primitives, run.query, run.sum ? 1 : run.count, dst,
                                            run.offset + VkDeviceSize(counters) * 8, size,
                                            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            zero_other_draw_kind(run);
         }
         if (suspend) vk.begin_conditional_rendering(cb, &predicate);
         begin_statistics();

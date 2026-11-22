@@ -494,17 +494,16 @@ int main() {
     unsigned differ = 0;
     if (host_ran) {
         EXPECT(consistent(host));
-        // Required: AS, MS and MSPrimitives of every mesh query, and AS, MS and the 11 classic counters of the VS
-        // draw. Every other difference is printed: on NVIDIA (driver 610.88) the Vulkan driver counts the VS draw's
-        // triangle in MESH_PRIMITIVES_GENERATED, and mesh groups and threads in IAVertices, IAPrimitives and
-        // VSInvocations, which its D3D12 driver does not (an open finding of D3D-132).
-        const auto compare = [&](const char* query, const UINT64* ours, const UINT64* theirs, bool mesh) {
+        // Every counter is required to match. On NVIDIA the Vulkan driver counts the VS draw's triangle in
+        // MESH_PRIMITIVES_GENERATED, and mesh groups and threads in IAVertices, IAPrimitives and VSInvocations, which
+        // its D3D12 driver does not (D3D-339); each query here sees one kind of draw, and the layer zeroes those
+        // counters at resolve. A query that mixes mesh and vertex draws is not covered yet.
+        const auto compare = [&](const char* query, const UINT64* ours, const UINT64* theirs, bool) {
             for (UINT i = 0; i < kWords; ++i) {
                 if (ours[i] == theirs[i]) continue;
-                const bool required = i == kAS || i == kMS || (mesh ? i == kMSPrimitives : i < 11);
-                differ += required;
-                std::printf("%s %s: layer %llu, host %llu%s\n", query, kCounterNames[i], ours[i], theirs[i],
-                            required ? " (required to match)" : " (known Vulkan driver difference)");
+                ++differ;
+                std::printf("%s %s: layer %llu, host %llu (required to match)\n", query, kCounterNames[i], ours[i],
+                            theirs[i]);
             }
         };
         compare("VS draw", layer.statistics1[0].data(), host.statistics1[0].data(), false);
