@@ -637,6 +637,10 @@ struct ShaderEntry {
     bool emulated() const { return !wave64_exchange.empty(); }
     std::vector<SignatureElement> input_signature;  // vertex shaders: what the input layout must feed
     std::vector<std::uint32_t> outputs;             // pixel shaders: the render-target locations written
+    // Mesh shaders: the output array sizes the SPIR-V declares (OutputVertices / OutputPrimitivesEXT), checked
+    // against the device's maxMeshOutputVertices / maxMeshOutputPrimitives when a pipeline is created. 0: not given.
+    std::uint32_t max_vertices = 0;
+    std::uint32_t max_primitives = 0;
 };
 
 class ShaderLibrary {
@@ -798,6 +802,8 @@ private:
             }
             if (const Json* o = meta.find("outputs"); o && o->kind == Json::Kind::array)
                 for (const Json& item : o->array) e.outputs.push_back(u32(&item));
+            e.max_vertices = u32(meta.find("max_vertices"));
+            e.max_primitives = u32(meta.find("max_primitives"));
             if (by_fspx) fspx_entries_[{e.stage, e.fspx_code_sha256}].push_back(e);
             if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
             ++count_;
