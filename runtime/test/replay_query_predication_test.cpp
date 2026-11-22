@@ -3,7 +3,9 @@
 // an active conditional rendering scope (D3D-148). Check that emit() suspends conditional rendering for the
 // entire ResolveQueryData loop (not only before helper dispatches) and restores it afterward. Cases 5 and 6 check
 // how resolves inside a pipeline-statistics query are replayed; cases 7 and 8 cover the other helper dispatches
-// and their no-pool fallback (D3D-162). No GPU or game data.
+// and their no-pool fallback (D3D-162). Cases 9 to 12 cover PIPELINE_STATISTICS1 (D3D-132): the primitives query
+// beside the statistics one, the 14-UINT64 resolve layout, a split query summed over 13-counter segments, and an
+// 11-counter resolve of such segments. No GPU or game data.
 #include "../src/vulkan_replay.h"
 #include <cstdint>
 #include <cstdio>
@@ -53,16 +55,19 @@ VKAPI_ATTR void VKAPI_CALL mock_fill_buffer(VkCommandBuffer, VkBuffer, VkDeviceS
     g_trace->events.push_back("fill");
 }
 
-VKAPI_ATTR void VKAPI_CALL mock_copy_query(VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t, VkBuffer,
-                                           VkDeviceSize, VkDeviceSize, VkQueryResultFlags) {
-    ++g_trace->copies;
-    if (g_trace->cond_active) ++g_trace->copies_while_cond;
-    g_trace->events.push_back("copy_query");
-}
-
 std::string query_event(const char* name, VkQueryPool pool, std::uint32_t index) {
     return std::string(name) + " " + std::to_string(reinterpret_cast<std::uintptr_t>(pool)) + ":" +
            std::to_string(index);
+}
+
+// "copy_query pool:first+count @offset/stride"
+VKAPI_ATTR void VKAPI_CALL mock_copy_query(VkCommandBuffer, VkQueryPool pool, std::uint32_t first,
+                                           std::uint32_t count, VkBuffer, VkDeviceSize offset, VkDeviceSize stride,
+                                           VkQueryResultFlags) {
+    ++g_trace->copies;
+    if (g_trace->cond_active) ++g_trace->copies_while_cond;
+    g_trace->events.push_back(query_event("copy_query", pool, first) + "+" + std::to_string(count) + " @" +
+                              std::to_string(offset) + "/" + std::to_string(stride));
 }
 
 VKAPI_ATTR void VKAPI_CALL mock_reset_query(VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t) {}
@@ -99,10 +104,17 @@ int main() {
     QueryPool heap{handle<VkQueryPool>(3), d3d12_query_heap::occlusion, 4, false, {false, true, false, true}, {}};
     QueryPool statistics_heap{handle<VkQueryPool>(7), d3d12_query_heap::pipeline_statistics, 2, false,
                               {false, false}, {}};
+    // PIPELINE_STATISTICS1: statistics pool 13, primitives pool 14 (heap ID 12). Resolved into buffer 3 (512 bytes).
+    QueryPool statistics1_heap{handle<VkQueryPool>(13), d3d12_query_heap::pipeline_statistics1, 2, false,
+                               {false, false}, {}, handle<VkQueryPool>(14)};
+    ResourceBinding big{};
+    big.buffer = handle<VkBuffer>(15);
+    big.size = 512;
 
     const auto resolve = [&](ResourceId id) -> const ResourceBinding* {
         if (id == 1) return &dst;
         if (id == 2) return &pred;
+        if (id == 3) return &big;
         return nullptr;
     };
 
@@ -121,11 +133,16 @@ int main() {
     vk.copy_query_pool_results = mock_copy_query;
     vk.fill_buffer = mock_fill_buffer;
     vk.query_pool = [&](QueryHeapId id) -> QueryPool* {
-        return id == 1 ? &heap : id == 6 ? &statistics_heap : nullptr;
+        return id == 1 ? &heap : id == 6 ? &statistics_heap : id == 12 ? &statistics1_heap : nullptr;
     };
-    vk.sum_statistics = [](VkCommandBuffer, VkQueryPool pool, std::uint32_t first, std::uint32_t count, VkBuffer,
-                           VkDeviceSize) {
-        g_trace->events.push_back(query_event("sum_statistics", pool, first) + "+" + std::to_string(count));
+    // "sum_statistics pool:first+count", then " segment->written @offset" unless both counter counts are 11.
+    vk.sum_statistics = [](VkCommandBuffer, VkQueryPool pool, std::uint32_t first, std::uint32_t count,
+                           std::uint32_t segment_counters, std::uint32_t counters, VkBuffer, VkDeviceSize offset) {
+        std::string event = query_event("sum_statistics", pool, first) + "+" + std::to_string(count);
+        if (segment_counters != 11 || counters != 11)
+            event += " " + std::to_string(segment_counters) + "->" + std::to_string(counters) + " @" +
+                     std::to_string(offset);
+        g_trace->events.push_back(event);
     };
     vk.resolve_binary_occlusion = [](VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t, VkBuffer,
                                      VkDeviceSize) {
@@ -368,6 +385,102 @@ int main() {
             QueryReplay missing;
             expect(missing.plan(prepared) == ReplayResult::unsupported, "each helper needs a statistics pool");
         }
+    }
+
+    // 9. PIPELINE_STATISTICS1 without a split: the primitives query runs beside the statistics query, and the resolve
+    //    writes 14 UINT64s per query, 112 bytes apart: the 13 statistics from pool 13, MSPrimitives from pool 14 at
+    //    +104, and zeros for the query that was never ended.
+    {
+        Trace trace;
+        g_trace = &trace;
+        CommandList list;
+        expect(list.begin_query({12, d3d12_query::pipeline_statistics1, 0}), "record statistics1 begin");
+        expect(list.end_query({12, d3d12_query::pipeline_statistics1, 0}), "record statistics1 end");
+        expect(list.resolve_queries({12, d3d12_query::pipeline_statistics1, 0, 2, 3, 16}),
+               "record statistics1 resolve");
+        expect(list.close(), "close statistics1 list");
+        expect(replay(list, VK_NULL_HANDLE, resolve, vk) == ReplayResult::success, "replay statistics1");
+        const std::vector<std::string> want{"begin_query 14:0", "begin_query 13:0", "end_query 14:0",
+                                            "end_query 13:0", "copy_query 13:0+1 @16/112",
+                                            "copy_query 14:0+1 @120/112", "fill"};
+        expect(trace.events == want, "statistics1: both queries run, and the resolve lays out 14 UINT64s");
+        expect(trace.fills == 1, "statistics1: the query never ended reads zero");
+    }
+
+    // 10. A split PIPELINE_STATISTICS1 query: the statistics run in 13-counter segments around the helper dispatch,
+    //     the primitives query is not split (helpers make no primitives), and the resolve sums the segments into the
+    //     first 13 UINT64s and copies MSPrimitives after them.
+    {
+        Trace trace;
+        g_trace = &trace;
+        CommandList list;
+        expect(list.begin_query({12, d3d12_query::pipeline_statistics1, 1}), "record split statistics1 begin");
+        expect(list.resolve_queries({1, d3d12_query::binary_occlusion, 1, 1, 1, 0}), "record split inner resolve");
+        expect(list.end_query({12, d3d12_query::pipeline_statistics1, 1}), "record split statistics1 end");
+        expect(list.resolve_queries({12, d3d12_query::pipeline_statistics1, 1, 1, 3, 0}), "record split resolve");
+        expect(list.close(), "close split statistics1 list");
+        PreparedList prepared;
+        expect(prepare(list, resolve, vk, prepared) == ReplayResult::success, "prepare split statistics1");
+        expect(prepared.statistics_segment_count == 2 && prepared.statistics1_segments,
+               "split statistics1: two segments that must count task and mesh invocations");
+        auto segments = std::make_shared<OcclusionSegmentPool>();
+        segments->pool = handle<VkQueryPool>(9);
+        segments->destroy = mock_destroy_pool;
+        segments->counters = 13;
+        QueryReplay queries;
+        expect(queries.plan(prepared, {}, 0, true, segments, 4) == ReplayResult::success, "plan split statistics1");
+        emit(prepared, VK_NULL_HANDLE, vk);
+        queries.commit();
+        const std::vector<std::string> want{"begin_query 14:1", "begin_query 9:4", "end_query 9:4", "binary",
+                                            "begin_query 9:5",  "end_query 14:1", "end_query 9:5",
+                                            "sum_statistics 9:4+2 13->13 @0", "copy_query 14:1+1 @104/112"};
+        expect(trace.events == want, "split statistics1: segments summed, primitives copied after them");
+    }
+
+    // 11. An 11-counter PIPELINE_STATISTICS query split into a 13-counter segment pool (one that also holds a
+    //     PIPELINE_STATISTICS1 query's segments) writes only its 11 sums; 11-counter segments cannot resolve a
+    //     PIPELINE_STATISTICS1 query.
+    for (const bool mesh : {false, true}) {
+        Trace trace;
+        g_trace = &trace;
+        const QueryHeapId id = mesh ? 12 : 6;
+        const std::uint32_t type = mesh ? d3d12_query::pipeline_statistics1 : d3d12_query::pipeline_statistics;
+        CommandList list;
+        expect(list.begin_query({id, type, 0}), "record mixed-width begin");
+        expect(list.resolve_queries({1, d3d12_query::binary_occlusion, 1, 1, 1, 0}), "record mixed-width inner");
+        expect(list.end_query({id, type, 0}), "record mixed-width end");
+        expect(list.resolve_queries({id, type, 0, 1, 3, 0}), "record mixed-width resolve");
+        expect(list.close(), "close mixed-width list");
+        PreparedList prepared;
+        expect(prepare(list, resolve, vk, prepared) == ReplayResult::success, "prepare mixed-width list");
+        auto segments = std::make_shared<OcclusionSegmentPool>();
+        segments->pool = handle<VkQueryPool>(9);
+        segments->destroy = mock_destroy_pool;
+        segments->counters = mesh ? 11 : 13;
+        QueryReplay queries;
+        const ReplayResult planned = queries.plan(prepared, {}, 0, true, segments, 4);
+        if (mesh) {
+            expect(planned == ReplayResult::unsupported, "11-counter segments cannot resolve PIPELINE_STATISTICS1");
+            continue;
+        }
+        expect(planned == ReplayResult::success, "plan 11-counter resolve of 13-counter segments");
+        emit(prepared, VK_NULL_HANDLE, vk);
+        expect(!trace.events.empty() && trace.events.back() == "sum_statistics 9:4+2 13->11 @0",
+               "11-counter resolve of 13-counter segments writes 11 sums");
+    }
+
+    // 12. A PIPELINE_STATISTICS1 heap without its primitives pool cannot run the query.
+    {
+        QueryPool broken = statistics1_heap;
+        broken.primitives = VK_NULL_HANDLE;
+        auto missing = vk;
+        missing.query_pool = [&](QueryHeapId id) -> QueryPool* { return id == 12 ? &broken : nullptr; };
+        CommandList list;
+        expect(list.begin_query({12, d3d12_query::pipeline_statistics1, 0}), "record primitives-less begin");
+        expect(list.end_query({12, d3d12_query::pipeline_statistics1, 0}) && list.close(),
+               "record primitives-less end");
+        expect(replay(list, VK_NULL_HANDLE, resolve, missing) == ReplayResult::unsupported,
+               "statistics1 without a primitives pool is unsupported");
     }
 
     if (failures) return 1;

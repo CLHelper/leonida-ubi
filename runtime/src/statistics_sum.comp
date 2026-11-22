@@ -1,22 +1,27 @@
 #version 450
 
-// Adds the D3D12_QUERY_DATA_PIPELINE_STATISTICS segments of one split pipeline-statistics query (D3D-162): one
-// invocation per counter, in the order of VkQueryPipelineStatisticFlagBits, which is the D3D12 field order.
-layout(local_size_x = 11) in;
+// Adds the segments of one split pipeline-statistics query (D3D-162): one invocation per counter, in the order of
+// VkQueryPipelineStatisticFlagBits, which is the D3D12 field order of D3D12_QUERY_DATA_PIPELINE_STATISTICS and of
+// the first 13 fields of D3D12_QUERY_DATA_PIPELINE_STATISTICS1. `counters` is what each segment holds: 11, or 13
+// when the segment pool also counts task and mesh shader invocations (D3D-132).
+layout(local_size_x = 13) in;
 layout(set = 0, binding = 0, std430) buffer QueryResults {
-    uvec2 total[11];
-    uvec2 segments[];  // `count` results of 11 counters each
+    uvec2 words[];  // `counters` running sums, then `count` segments of `counters` values each
 };
-layout(push_constant) uniform ResolveRange { uint count; };
+layout(push_constant) uniform ResolveRange {
+    uint count;
+    uint counters;
+};
 
 void main() {
     const uint counter = gl_LocalInvocationID.x;
-    uvec2 sum = total[counter];
+    if (counter >= counters) return;
+    uvec2 sum = words[counter];
     for (uint i = 0; i < count; ++i) {
-        uvec2 segment = segments[i * 11 + counter];
+        uvec2 segment = words[counters + i * counters + counter];
         uint low = sum.x + segment.x;
         sum.y += segment.y + uint(low < sum.x);
         sum.x = low;
     }
-    total[counter] = sum;
+    words[counter] = sum;
 }

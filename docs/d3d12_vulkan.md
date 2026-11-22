@@ -1495,7 +1495,7 @@ The trace will enumerate them.
 | Resource barriers (legacy) | `vkCmdPipelineBarrier` | Per-subresource state tracking; `BEGIN_ONLY`/`END_ONLY` become conservative full barriers at the begin point. |
 | Enhanced barriers (`ID3D12GraphicsCommandList7::Barrier`) | `vkCmdPipelineBarrier2` | Direct mapping of sync/access/layout; prefer it when the game uses it. |
 | `IDXGISwapChain` / `IDXGIFactory` | Factory/adapter/output: fake objects. `Swapchain` over `VkSwapchainKHR` + Win32 surface: only for the PC-style path | Shim DXGI; do not bind host DXGI. A GDKX title likely creates no swapchain (§4.5); it needs `IDXGIDevice1`→`GetAdapter`→`EnumOutputs` and a `PresentX` + frame-event presenter instead. |
-| `ID3D12QueryHeap` | `VkQueryPool` | Occlusion, binary occlusion, pipeline statistics, timestamps. Binary results clamped to 0/1. |
+| `ID3D12QueryHeap` | `VkQueryPool` | Occlusion, binary occlusion, pipeline statistics (and `PIPELINE_STATISTICS1` with a mesh-primitives pool), timestamps. Binary results clamped to 0/1. |
 | `ID3D12CommandSignature` | `IndirectLayout` | Simple draw/dispatch signatures map to indirect calls; root-constant/vertex/index/descriptor changes need expansion. |
 | `ID3D12PipelineLibrary` | map + `VkPipelineCache` | D3D12 cached blobs are ignored. |
 | `ID3D12StateObject` (ray tracing) | likely unused | RT work includes compute traversal (`image_bvh*`) plus `XboxBvhBuilder`; a DXR state-object path is stubbed until the trace shows it. |
@@ -2130,8 +2130,20 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   `PIPELINE_STATISTICS` heaps count all eleven Vulkan statistics (`0x7ff`), whose result order is the field order
   of `D3D12_QUERY_DATA_PIPELINE_STATISTICS` (IA vertices, IA primitives, VS, GS invocations, GS primitives,
   clipper invocations and primitives, PS, HS, DS, CS), so one 88-byte result per query is copied as is. They need
-  `pipelineStatisticsQuery`. `SO_STATISTICS`, `VIDEO_DECODE_STATISTICS` and `PIPELINE_STATISTICS1` (mesh and
-  amplification counts) are logged and refused with `E_NOTIMPL`.
+  `pipelineStatisticsQuery`. `PIPELINE_STATISTICS1` heaps (D3D-132) need `VK_EXT_mesh_shader`'s
+  `meshShaderQueries` as well (enabled with `meshShader` where the GPU has it; `OPTIONS9.MeshShaderPipelineStatsSupported`
+  reports it) and are refused with `E_NOTIMPL` without it; no host adapter measured so far refuses them, so the host's
+  refusal code is not known. Each holds a statistics pool counting the eleven plus `TASK_SHADER_INVOCATIONS` (0x800)
+  and `MESH_SHADER_INVOCATIONS` (0x1000), which Vulkan writes after `CSInvocations` in bit order, the order of
+  `ASInvocations` and `MSInvocations`; and a `VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT` pool for `MSPrimitives`,
+  begun and ended with the statistics query of the same index. A resolve copies the 13 statistics with a 112-byte
+  stride and the primitives into the 14th UINT64 of each result. Measured on an RTX 3070 Ti (driver 610.88) against
+  its D3D12 driver (`d3d12_mesh_statistics_test`): `ASInvocations`, `MSInvocations` (32 per 32-thread group) and
+  `MSPrimitives` of mesh draws match, but NVIDIA's Vulkan driver also counts a VS draw's triangles in
+  `MESH_PRIMITIVES_GENERATED` (D3D12: 0) and mesh groups and threads in `IAVertices`, `IAPrimitives` and
+  `VSInvocations` (D3D12: 0). Matching those would need the queries split where draws change between mesh and
+  vertex pipelines, with per-segment counter masks; that is open. `SO_STATISTICS` and `VIDEO_DECODE_STATISTICS`
+  are logged and refused with `E_NOTIMPL`.
 - **Recording.** The list keeps D3D12's rules for the calls: timestamps only have `EndQuery`; every other query is
   begun and ended in the same list with the same type, is not begun again while it runs, and is not resolved while
   it runs; resolve offsets are multiples of 8. A list closed with a query still running reports `E_INVALIDARG` and
@@ -2166,7 +2178,10 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   Its counters go to physical `PIPELINE_STATISTICS` segments in a pool of the submission's own; a segment ends
   before each helper and a new one begins after it. Non-query helpers and resolves share the segment numbering.
   Its result is the sum of its segments, added per counter by a compute dispatch (`statistics_sum.comp`) on the
-  same scratch buffer, which is itself kept out of any statistics query still running.
+  same scratch buffer, which is itself kept out of any statistics query still running. When a submission splits a
+  `PIPELINE_STATISTICS1` query, its segment pool counts the 13 statistics and the sum writes only as many as the
+  result has (11 for a `PIPELINE_STATISTICS` query sharing the pool); the primitives query is not split, since
+  helper dispatches make no mesh primitives, and is copied after the sums.
   Whether a resolve dispatches is only known once the list is planned against the heaps, so every such resolve
   splits the query. `vk_binary_occlusion` checks that a binary resolve and a statistics sum inside statistics queries
   leave every counter at 0. `vk_overlapping_occlusion` puts a native draw in each segment and checks the split sums

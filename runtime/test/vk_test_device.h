@@ -111,6 +111,8 @@ public:
     bool buffer_device_address = false;  // enabled: buffer() memory and buffers can be addressed (device_address())
     bool request_mesh_shader = false;  // set before create(): enable VK_EXT_mesh_shader (meshShader) where available
     bool mesh_shader = false;          // VK_EXT_mesh_shader and meshShader are enabled
+    // With mesh_shader: meshShaderQueries is enabled too (it is whenever the GPU has it and pipelineStatisticsQuery).
+    bool mesh_shader_queries = false;
     bool debug_utils = false;          // VK_EXT_debug_utils is enabled on the instance
     // The subgroup sizes of the device, with subgroupSizeControl and computeFullSubgroups enabled where it has them.
     leonida::SubgroupSizeCaps subgroup;
@@ -459,10 +461,13 @@ public:
             VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &mesh_features};
             instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
             mesh_shader = mesh_features.meshShader == VK_TRUE;
+            mesh_shader_queries = mesh_shader && mesh_features.meshShaderQueries == VK_TRUE &&
+                                  features.features.pipelineStatisticsQuery == VK_TRUE;
         }
         if (mesh_shader) {
             mesh_features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT, *v13_.next()};
             mesh_features.meshShader = VK_TRUE;
+            mesh_features.meshShaderQueries = mesh_shader_queries ? VK_TRUE : VK_FALSE;
             *v13_.next() = &mesh_features;
         }
         enable.occlusionQueryPrecise = features.features.occlusionQueryPrecise;  // query heaps, where available

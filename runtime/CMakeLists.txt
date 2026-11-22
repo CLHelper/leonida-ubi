@@ -1581,6 +1581,17 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_mesh_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_mesh COMMAND d3d12_mesh_test)
       set_tests_properties(d3d12_mesh PROPERTIES SKIP_RETURN_CODE 77)
+      # D3D-132: PIPELINE_STATISTICS1 queries around VS and mesh draws, compared with host D3D12 (DXIL compiled at
+      # run time by the Windows SDK's dxcompiler.dll); skips without meshShaderQueries.
+      add_executable(d3d12_mesh_statistics_test test/d3d12_mesh_statistics_test.cpp shims/d3d12_xs_device.cpp
+                     ${LEONIDA_TEST_MS} ${LEONIDA_TEST_PS} ${LEONIDA_TEST_VS_FULLSCREEN})
+      target_link_libraries(d3d12_mesh_statistics_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+      target_compile_definitions(d3d12_mesh_statistics_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_MS_SPV="${LEONIDA_TEST_MS}" LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}"
+                                 LEONIDA_TEST_VS_FULLSCREEN_SPV="${LEONIDA_TEST_VS_FULLSCREEN}")
+      target_compile_options(d3d12_mesh_statistics_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_mesh_statistics COMMAND d3d12_mesh_statistics_test)
+      set_tests_properties(d3d12_mesh_statistics PROPERTIES SKIP_RETURN_CODE 77)
     else()
       message(STATUS "glslangValidator not found: d3d12_compute_test, d3d12_draw_test, d3d12_set0_compute_test and d3d12_mesh_test are not built")
     endif()

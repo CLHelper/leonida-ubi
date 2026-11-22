@@ -1,7 +1,8 @@
 // Query heaps and query calls on the Vulkan-backed device against Windows D3D12 (the default adapter and WARP):
 // CreateQueryHeap results by type, count and node mask, Close() results of lists that use queries on each list type,
-// and timestamps resolved on direct, compute and copy queues (pipeline statistics heaps are left out: the test
-// device does not enable pipelineStatisticsQuery). No game data or shaders. Run explicitly (needs Vulkan
+// and timestamps resolved on direct, compute and copy queues (PIPELINE_STATISTICS heaps are left out, as the layer
+// device here is not given pipelineStatisticsQuery; PIPELINE_STATISTICS1 heaps are compared when the GPU has
+// meshShaderQueries). No game data or shaders. Run explicitly (needs Vulkan
 // hardware); LEONIDA_VK_VALIDATION=1 checks Vulkan usage.
 #include "vk_test_device.h"
 #include "host_wine.h"
@@ -39,10 +40,15 @@ struct Env {
     Ref<ID3D12Resource> readback;  // readback buffer
 };
 
+// The layer's device has meshShaderQueries: PIPELINE_STATISTICS1 heaps are compared too (D3D-132). Without it the
+// layer refuses them (d3d12_mesh_statistics_test checks that) and the host on this machine may not.
+bool g_statistics1 = false;
+
 std::string heap_cases(ID3D12Device* device) {
     std::string out;
-    const D3D12_QUERY_HEAP_TYPE types[] = {D3D12_QUERY_HEAP_TYPE_OCCLUSION, D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
-                                           D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP, D3D12_QUERY_HEAP_TYPE(99)};
+    std::vector<D3D12_QUERY_HEAP_TYPE> types = {D3D12_QUERY_HEAP_TYPE_OCCLUSION, D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                                                D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP, D3D12_QUERY_HEAP_TYPE(99)};
+    if (g_statistics1) types.push_back(D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1);
     for (const auto type : types)
         for (const UINT count : {0u, 1u})
             for (const UINT mask : {0u, 1u, 2u, 3u}) {
@@ -243,6 +249,7 @@ std::vector<std::string> lines(const std::string& s) {
 
 int main() {
     vktest::Device vk;
+    vk.request_mesh_shader = true;  // meshShaderQueries, where the GPU has it
     const auto device_status = vk.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;
     if (device_status != vktest::DeviceStatus::ready) return 1;
@@ -257,6 +264,10 @@ int main() {
         info.device = vk.device;
         info.queue = vk.queue;
         info.queue_family = vk.family;
+        info.mesh_shader = vk.mesh_shader;
+        info.pipeline_statistics_query = vk.pipeline_statistics_query;
+        info.mesh_shader_queries = vk.mesh_shader_queries;
+        g_statistics1 = vk.mesh_shader_queries;
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
         mine = all_cases(ours.p);
         {  // A timestamp heap of the wrong kind for the list: the host refuses it at Close (E_INVALIDARG); the layer

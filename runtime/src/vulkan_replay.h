@@ -704,6 +704,9 @@ struct OcclusionSegmentPool {
     VkDevice device = VK_NULL_HANDLE;
     PFN_vkDestroyQueryPool destroy = nullptr;
     VkQueryPool pool = VK_NULL_HANDLE;
+    // Pipeline-statistics segment pools: the counters each segment holds, in VkQueryPipelineStatisticFlagBits order
+    // (11 for the D3D12_QUERY_DATA_PIPELINE_STATISTICS ones, 13 when ASInvocations and MSInvocations are counted).
+    std::uint32_t counters = pipeline_statistics_counters;
 
     OcclusionSegmentPool() = default;
     OcclusionSegmentPool(const OcclusionSegmentPool&) = delete;
@@ -726,7 +729,20 @@ struct QueryPool {
     bool precise = false;         // occlusionQueryPrecise: D3D12_QUERY_TYPE_OCCLUSION counts exact samples
     std::vector<bool> ended;
     std::unordered_map<std::uint32_t, OcclusionResult> occlusion;
+    // PIPELINE_STATISTICS1 heaps: a VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT query per D3D12 query, run beside
+    // the statistics query of the same index in `pool` (which counts 13 statistics: the 11 classic ones, then task
+    // and mesh shader invocations). It supplies MSPrimitives, the last field of D3D12_QUERY_DATA_PIPELINE_STATISTICS1.
+    VkQueryPool primitives = VK_NULL_HANDLE;
 };
+
+// The Vulkan statistics a D3D12 pipeline-statistics query counts. VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT
+// through COMPUTE_SHADER_INVOCATIONS_BIT (0x1-0x400) are, in bit order (the order Vulkan writes results in), the
+// fields of D3D12_QUERY_DATA_PIPELINE_STATISTICS. PIPELINE_STATISTICS1 adds TASK_SHADER_INVOCATIONS (0x800,
+// ASInvocations) and MESH_SHADER_INVOCATIONS (0x1000, MSInvocations), which follow CSInvocations in both orders.
+inline constexpr VkQueryPipelineStatisticFlags pipeline_statistics_flags = 0x7ff;
+inline constexpr VkQueryPipelineStatisticFlags pipeline_statistics1_flags =
+    pipeline_statistics_flags | VK_QUERY_PIPELINE_STATISTIC_TASK_SHADER_INVOCATIONS_BIT_EXT |
+    VK_QUERY_PIPELINE_STATISTIC_MESH_SHADER_INVOCATIONS_BIT_EXT;
 
 // A compute pipeline as replay needs it. code_base is the console VA of the shader's FSSM blob (push-constant
 // dwords 34-35), 0 when the shader does not read it.
@@ -824,10 +840,12 @@ struct ReplayFunctions {
     // Resolves available binary-occlusion queries to 64-bit 0/1 values, outside conditional rendering.
     std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t first, std::uint32_t count,
                        VkBuffer dst, VkDeviceSize offset)> resolve_binary_occlusion;
-    // Adds `count` pipeline-statistics results into one D3D12_QUERY_DATA_PIPELINE_STATISTICS, outside conditional
-    // rendering: the segments of a statistics query split around resolves (D3D-162).
+    // Adds `count` pipeline-statistics results of `segment_counters` counters each, outside conditional rendering:
+    // the segments of a statistics query split around resolves (D3D-162). The first `counters` sums (11 for
+    // D3D12_QUERY_DATA_PIPELINE_STATISTICS, 13 for the statistics part of ..._STATISTICS1) are written to dst.
     std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t first, std::uint32_t count,
-                       VkBuffer dst, VkDeviceSize offset)> sum_statistics;
+                       std::uint32_t segment_counters, std::uint32_t counters, VkBuffer dst, VkDeviceSize offset)>
+        sum_statistics;
     // VK_EXT_debug_utils, set only when the instance enabled it; debug markers are skipped without them.
     PFN_vkCmdInsertDebugUtilsLabelEXT insert_label = nullptr;
     PFN_vkCmdBeginDebugUtilsLabelEXT begin_label = nullptr;
@@ -891,6 +909,10 @@ struct QueryResolveRun {
     std::uint32_t count = 0;
     VkDeviceSize offset = 0;
     bool sum = false;
+    // The heap index of the run's first query (PIPELINE_STATISTICS1: where its primitives query is), and for a sum
+    // the counters each of its segments holds.
+    std::uint32_t query = 0;
+    std::uint32_t segment_counters = 0;
 };
 
 struct PreparedQuery {
@@ -1975,6 +1997,8 @@ public:
     VkQueryPool statistics_pool = VK_NULL_HANDLE;
     std::uint32_t statistics_base = 0;
     std::uint32_t statistics_segment_count = 0;
+    // A PIPELINE_STATISTICS1 query is split: the segment pool must count task and mesh invocations too (13 counters).
+    bool statistics1_segments = false;
     // Copies, resolves and UAV clears that run as transfers, recorded while a predicate was set. D3D12 skips them
     // when the predicate says so, but Vulkan's conditional rendering does not cover transfer commands, so they run
     // unconditionally (docs/d3d12_vulkan.md section 4.7). Counted so the caller can report it.
@@ -2032,7 +2056,7 @@ inline void plan_statistics_segments(PreparedList& out) {
         if (std::holds_alternative<ResolveQueries>(command)) {
             if (begin && range.type != d3d12_query::timestamp)
                 inner.push_back({&query.statistics_end, &query.statistics_begin});
-        } else if (range.type == d3d12_query::pipeline_statistics) {
+        } else if (is_pipeline_statistics(range.type)) {
             if (std::holds_alternative<BeginQuery>(command)) {
                 begin = &query;
                 inner.clear();
@@ -2047,6 +2071,7 @@ inline void plan_statistics_segments(PreparedList& out) {
                     query.statistics_end = out.statistics_segment_count - 1;
                     query.statistics_first = first;
                     query.statistics_count = out.statistics_segment_count - first;
+                    out.statistics1_segments |= range.type == d3d12_query::pipeline_statistics1;
                 }
                 begin = nullptr;
                 inner.clear();
@@ -2121,6 +2146,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     out.precise_segments = false;
     out.statistics_pool = VK_NULL_HANDLE;
     out.statistics_base = out.statistics_segment_count = 0;
+    out.statistics1_segments = false;
     const bool rendering = vk.begin_rendering && vk.end_rendering && vk.clear_attachments && vk.image_view;
     const bool copies = vk.copy_buffer && vk.copy_buffer_to_image && vk.copy_image_to_buffer && vk.copy_image;
     const bool conditional = vk.begin_conditional_rendering && vk.end_conditional_rendering;
@@ -2459,6 +2485,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (range.first >= heap->count || range.count > heap->count - range.first)
                 return ReplayResult::invalid_query;
             if (!query_result_size(range.type)) return ReplayResult::unsupported;
+            // PIPELINE_STATISTICS1 counts MSPrimitives in a second pool beside the statistics one.
+            if (range.type == d3d12_query::pipeline_statistics1 && !heap->primitives) return ReplayResult::unsupported;
             if (range.type != d3d12_query::timestamp && !std::holds_alternative<ResolveQueries>(command)) {
                 const bool begin = std::holds_alternative<BeginQuery>(command);
                 if (range.type == d3d12_query::occlusion) {
@@ -2626,7 +2654,7 @@ public:
             } else {
                 const auto& resolve = std::get<ResolveQueries>(command);
                 const bool binary = resolve.type == d3d12_query::binary_occlusion;
-                const bool statistics = resolve.type == d3d12_query::pipeline_statistics;
+                const bool statistics = is_pipeline_statistics(resolve.type);
                 // A helper dispatch inside an unsplit statistics query would count in the application's
                 // CSInvocations.
                 const bool uncounted = !query.statistics_active ||
@@ -2639,11 +2667,18 @@ public:
                     if (binary && value.ended && !uncounted) return ReplayResult::unsupported;
                     needs_binary |= binary && value.ended;
                     detail::QueryResolveRun run{value.ended ? query.heap->pool : VK_NULL_HANDLE,
-                                                index, 1, offset + VkDeviceSize(i) * size};
+                                                index, 1, offset + VkDeviceSize(i) * size, false, index};
                     if (value.occlusion.segments) {
                         if (resolve.type != d3d12_query::occlusion && !statistics) return ReplayResult::invalid_query;
                         const auto& saved = value.occlusion;
-                        run = {saved.segments->pool, saved.first, saved.count, run.offset, saved.count > 1};
+                        // The segments must hold every statistic the resolve writes (13 for PIPELINE_STATISTICS1).
+                        // Segments with more counters than the result (13 for an 11-counter PIPELINE_STATISTICS
+                        // query) go through the sum, which writes only the result's: a copy would write all 13.
+                        const std::uint32_t counters = vulkan_statistics_counters(resolve.type);
+                        if (statistics && saved.segments->counters < counters) return ReplayResult::unsupported;
+                        const bool sum = saved.count > 1 || (statistics && saved.segments->counters != counters);
+                        run = {saved.segments->pool, saved.first, saved.count, run.offset, sum,
+                               index,                saved.segments->counters};
                         if (!can_sum || (run.sum && !uncounted)) return ReplayResult::unsupported;
                         (statistics ? needs_statistics_sum : needs_sum) |= run.sum;
                         retain(saved.segments);
@@ -2720,6 +2755,17 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
     };
     const auto& command = list.list->commands()[query.command];
     const QueryPool& heap = *query.heap;
+    // PIPELINE_STATISTICS1: MSPrimitives runs in the heap's primitives query of the same index, begun and ended
+    // with the statistics query. It is never split: the helper dispatches that split statistics make no primitives.
+    if (const auto range = query_range(command);
+        range.type == d3d12_query::pipeline_statistics1 && !std::holds_alternative<ResolveQueries>(command)) {
+        if (std::holds_alternative<BeginQuery>(command)) {
+            vk.reset_query_pool(cb, heap.primitives, range.first, 1);
+            vk.begin_query(cb, heap.primitives, range.first, 0);
+        } else {
+            vk.end_query(cb, heap.primitives, range.first);
+        }
+    }
     if (!std::holds_alternative<ResolveQueries>(command) &&
         (query.statistics_begin != none || query.statistics_end != none)) {
         end_statistics();
@@ -2740,6 +2786,8 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
     } else {
         const auto& resolve = std::get<ResolveQueries>(command);
         const bool binary = resolve.type == d3d12_query::binary_occlusion;
+        const bool statistics = is_pipeline_statistics(resolve.type);
+        const std::uint32_t counters = vulkan_statistics_counters(resolve.type);
         const auto size = query_result_size(resolve.type);
         const auto dst = list.commands[query.command].binding.buffer;
         // ResolveQueryData is unconditional in D3D12. Suspend conditional rendering for the whole resolve rather
@@ -2752,15 +2800,24 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
         for (const auto& run : query.resolves) {
             if (!run.pool) {
                 vk.fill_buffer(cb, dst, run.offset, VkDeviceSize(run.count) * size, 0);
-            } else if (run.sum && resolve.type == d3d12_query::pipeline_statistics) {
-                vk.sum_statistics(cb, run.pool, run.first, run.count, dst, run.offset);
+                continue;
+            }
+            if (run.sum && statistics) {
+                vk.sum_statistics(cb, run.pool, run.first, run.count, run.segment_counters, counters, dst,
+                                  run.offset);
             } else if (run.sum || binary) {
                 const auto& resolve_occlusion = run.sum ? vk.sum_occlusion : vk.resolve_binary_occlusion;
                 resolve_occlusion(cb, run.pool, run.first, run.count, dst, run.offset);
             } else {
+                // Each result is `size` bytes apart; a PIPELINE_STATISTICS1 copy fills its first 13 UINT64s.
                 vk.copy_query_pool_results(cb, run.pool, run.first, run.count, dst, run.offset, size,
                                            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
             }
+            // MSPrimitives, the 14th UINT64, from the primitives queries of the run's heap indices.
+            if (resolve.type == d3d12_query::pipeline_statistics1)
+                vk.copy_query_pool_results(cb, heap.primitives, run.query, run.sum ? 1 : run.count, dst,
+                                           run.offset + VkDeviceSize(counters) * 8, size,
+                                           VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
         }
         if (suspend) vk.begin_conditional_rendering(cb, &predicate);
         begin_statistics();
