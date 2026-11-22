@@ -4,7 +4,7 @@
 //     E_NOTIMPL; that part runs on every GPU. The rest needs the extension (exit 77 without it).
 //   - With it: MeshShaderTier 1; CreatePipelineState builds an MS + PS PSO and a VS + PS PSO from streams laid out as
 //     d3dx12.h lays them out (each subobject a type and its description, pointer-aligned); streams the PC runtime
-//     refuses (MS with VS, CS with PS, a subobject twice, an unknown type, a truncated stream) are E_INVALIDARG, and
+//     refuses (MS with VS, CS with PS, a subobject twice or in two versions, an unknown type, a truncated stream) are E_INVALIDARG, and
 //     state not built yet (an amplification shader, a depth-bounds test) is E_NOTIMPL.
 //   - Draws: DispatchMesh(2, 2, 1) with root constants (0, 0) and a red tint fills the top-left quadrant;
 //     DispatchMesh(1, 1, 2) moved by (1, -1) with a green tint fills the top half of the bottom-right one, so the
@@ -51,6 +51,9 @@ using MsSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, D3D12_SHAD
 using TopologySubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE>;
 using TargetsSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY>;
 using DepthStencil1Subobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, D3D12_DEPTH_STENCIL_DESC1>;
+using DepthStencilSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, D3D12_DEPTH_STENCIL_DESC>;
+using RasterizerSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC>;
+using Rasterizer2Subobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2, D3D12_RASTERIZER_DESC2>;
 using MaskSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, UINT>;
 
 // Subobjects appended one after another: each is pointer-aligned and a multiple of the pointer size, so the bytes
@@ -95,7 +98,12 @@ D3D12_MESH_SHADER_TIER mesh_tier(ID3D12Device* device) {
 int main() {
     vktest::Device d;
     d.request_mesh_shader = true;
-    EXPECT(d.create());
+    const auto device_status = d.initialize();
+    if (device_status == vktest::DeviceStatus::unavailable) {
+        std::fprintf(stderr, "SKIP: no usable Vulkan 1.3 device\n");
+        return 77;
+    }
+    EXPECT(device_status == vktest::DeviceStatus::ready);
 
     const auto ms_program = fssm_program({0x4d530001, 0xbf810000});
     const auto ps_program = fssm_program({0x50530001, 0xbf810000});
@@ -218,6 +226,38 @@ int main() {
         EXPECT(create(device.p, bad, refused) == E_INVALIDARG && !refused.p);
         Stream empty;
         EXPECT(create(device.p, empty.add(MaskSubobject{.inner = UINT_MAX}), refused) == E_INVALIDARG && !refused.p);
+        // Versions of one subobject count as the same subobject (D3D12_PIPELINE_STATE_STREAM_DESC): DEPTH_STENCIL with
+        // DEPTH_STENCIL1 in either order, and RASTERIZER with RASTERIZER2. Each description alone is accepted.
+        const D3D12_DEPTH_STENCIL_DESC depth{FALSE, D3D12_DEPTH_WRITE_MASK_ZERO, D3D12_COMPARISON_FUNC_ALWAYS};
+        const D3D12_DEPTH_STENCIL_DESC1 depth1{FALSE, D3D12_DEPTH_WRITE_MASK_ZERO, D3D12_COMPARISON_FUNC_ALWAYS};
+        D3D12_RASTERIZER_DESC raster{};
+        raster.FillMode = D3D12_FILL_MODE_SOLID;
+        raster.CullMode = D3D12_CULL_MODE_NONE;
+        raster.DepthClipEnable = TRUE;  // D3D12's default; depth clamping is not built
+        D3D12_RASTERIZER_DESC2 raster2{};
+        raster2.FillMode = D3D12_FILL_MODE_SOLID;
+        raster2.CullMode = D3D12_CULL_MODE_NONE;
+        raster2.DepthClipEnable = TRUE;  // D3D12's default; depth clamping is not built
+        for (int order = 0; order < 2; ++order) {
+            bad = mesh_stream;
+            if (order == 0) bad.add(DepthStencilSubobject{.inner = depth}).add(DepthStencil1Subobject{.inner = depth1});
+            else bad.add(DepthStencil1Subobject{.inner = depth1}).add(DepthStencilSubobject{.inner = depth});
+            EXPECT(create(device.p, bad, refused) == E_INVALIDARG && !refused.p);
+        }
+        bad = mesh_stream;
+        bad.add(RasterizerSubobject{.inner = raster}).add(Rasterizer2Subobject{.inner = raster2});
+        EXPECT(create(device.p, bad, refused) == E_INVALIDARG && !refused.p);
+        for (int which = 0; which < 4; ++which) {
+            Stream one = mesh_stream;
+            if (which == 0) one.add(DepthStencilSubobject{.inner = depth});
+            if (which == 1) one.add(DepthStencil1Subobject{.inner = depth1});
+            if (which == 2) one.add(RasterizerSubobject{.inner = raster});
+            if (which == 3) one.add(Rasterizer2Subobject{.inner = raster2});
+            Ref<ID3D12PipelineState> accepted;
+            const HRESULT one_hr = create(device.p, one, accepted);
+            if (FAILED(one_hr)) std::fprintf(stderr, "single subobject %d: 0x%08lx\n", which, static_cast<unsigned long>(one_hr));
+            EXPECT(SUCCEEDED(one_hr));
+        }
         // State the layer does not build yet.
         bad = mesh_stream;
         bad.add(AsSubobject{.inner = vs});
@@ -393,7 +433,7 @@ int main() {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
     }
-    std::printf("D3D-29: mesh tier 1; mesh and VS PSOs from pipeline state streams (6 refused as invalid, 2 as not "
+    std::printf("D3D-29: mesh tier 1; mesh and VS PSOs from pipeline state streams (9 refused as invalid, 2 as not "
                 "implemented); DispatchMesh over X, Y and Z and a stream VS draw matched all %u pixels; wrong-kind "
                 "draws fail at execution, oversized grids at Close\n",
                 size * size);

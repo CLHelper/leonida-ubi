@@ -2237,8 +2237,17 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
         D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
         if (size - at < sizeof(type)) return E_INVALIDARG;
         std::memcpy(&type, base + at, sizeof(type));
-        if (unsigned(type) >= 64 || (seen >> unsigned(type) & 1)) return E_INVALIDARG;
-        seen |= std::uint64_t(1) << unsigned(type);
+        // The versioned depth-stencil and rasterizer subobjects describe the same state as their base type, so the
+        // stream contract counts any two of one family as duplicates; the payload below still follows `type`.
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE family = type;
+        if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1 ||
+            type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2)
+            family = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL;
+        else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1 ||
+                 type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2)
+            family = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER;
+        if (unsigned(type) >= 64 || (seen >> unsigned(family) & 1)) return E_INVALIDARG;
+        seen |= std::uint64_t(1) << unsigned(family);
         bool ok = true;
         const auto take = [&](auto& value) {
             using T = std::remove_reference_t<decltype(value)>;
