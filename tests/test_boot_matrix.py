@@ -120,8 +120,11 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(name, "rt5")
         self.assertEqual(prs, [{"pr": 7286, "ref": "refs/boot-matrix/pr/7286"}, {"pr": 8517, "ref": "refs/heads/x"}])
 
+    def test_base_alone(self):
+        self.assertEqual(bm.parse_set("main="), ("main", []))
+
     def test_bad_specs(self):
-        for text in ("rt5", "=1", "a b=1", "rt5=x", "rt5=1,1", "rt5="):
+        for text in ("rt5", "=1", "a b=1", "rt5=x", "rt5=1,1", "rt5=1,"):
             with self.subTest(text=text), self.assertRaises(Exception):
                 bm.parse_set(text)
 
@@ -167,6 +170,18 @@ class MergeTest(RepoCase):
         self.assertEqual(self.git("rev-parse", "HEAD"), base)
         self.assertEqual(self.git("status", "--porcelain"), status_before)
         self.assertEqual(matrix["sets"][1]["prs"][0]["status"], "merged")
+        # #3 merges cleanly onto the base alone; it is skipped because of #2 before it.
+        self.assertEqual(bm.skip_reason(stack["prs"][2]), "conflicts with an earlier PR")
+        self.assertEqual(bm.skip_reason(stack["prs"][3]), "already-merged")
+
+    def test_conflict_with_base_and_base_alone(self):
+        self.pr(1, "runtime/slots.txt", "slot 10: bypass\n")
+        self.write("runtime/slots.txt", "slot 10: moved on main\n")
+        base = self.commit("main moves on")
+        _, matrix = self.merge("control=", "s=1", expect=1)
+        self.assertEqual((matrix["sets"][0]["head"], matrix["sets"][0]["prs"]), (base, []))
+        self.assertEqual(self.git("rev-parse", "refs/heads/boot-matrix/control"), base)
+        self.assertEqual(bm.skip_reason(matrix["sets"][1]["prs"][0]), "conflicts with base")
 
     def test_same_inputs_same_commit(self):
         self.pr(1, "runtime/slot10.txt", "unwrap\n")
@@ -277,7 +292,7 @@ class ReportTest(RepoCase):
         out, _ = self.merge("s=1,2", expect=1)
         matrix, rows = bm.report_rows(out)
         text = bm.format_markdown(matrix, rows)
-        self.assertIn("| #1 | #2 (conflict) | not run | - | - | - | - |", text)
+        self.assertIn("| #1 | #2 (conflicts with an earlier PR) | not run | - | - | - | - |", text)
 
 
 if __name__ == "__main__":

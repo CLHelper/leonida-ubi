@@ -169,7 +169,7 @@ order, and a shader library made by the same translator. `tools/boot_matrix.py` 
 
 ```powershell
 python -I tools\boot_matrix.py merge --base origin/main --fetch origin --out $matrix `
-    --set rt5=7286,8517 --set rt5-plus=7286,8517,6891
+    --set main= --set rt5=7286,8517 --set rt5-plus=7286,8517,6891
 # check out or export boot-matrix/rt5 where you build, then, per set:
 python -I tools\boot_matrix.py run $matrix --set rt5 --tree $tree --exe $exe --game-dir $pkg `
     --shaders $work\shaders\spirv --build
@@ -178,7 +178,9 @@ python -I tools\boot_matrix.py report $matrix
 
 * `merge` only runs git (`merge-tree --write-tree`, `commit-tree`): no checkout, nothing from a pull request runs.
   A PR that `scripts/merge_check.py` finds already on the base is skipped, so is one that conflicts with an earlier
-  PR in the set (its files are listed). Each set becomes the branch `boot-matrix/<set>`.
+  PR in the set (its files are listed, and whether it conflicts with the base itself or only with the PRs before
+  it). Each set becomes the branch `boot-matrix/<set>`; an empty set (`main=`) is the base alone, the row to compare
+  the others with.
 * `run` builds `runtime/` in the tree (or takes `--gta6rt`), runs `--run --trace --trace-d3d12` with
   `LEONIDA_D3D12=vulkan` and stops the process tree at `--timeout` (600 s). The traces stay in
   `<matrix>/<set>/runN/`; `result.json` has the stop, the D3D12 call count and the last call.
