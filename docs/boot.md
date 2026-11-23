@@ -182,8 +182,9 @@ python -I tools\boot_matrix.py report $matrix
   it). Each set becomes the branch `boot-matrix/<set>`; an empty set (`main=`) is the base alone, the row to compare
   the others with.
 * `run` builds `runtime/` in the tree (or takes `--gta6rt`), runs `--run --trace --trace-d3d12` with
-  `LEONIDA_D3D12=vulkan` and stops the process tree at `--timeout` (600 s). The traces stay in
-  `<matrix>/<set>/runN/`; `result.json` has the stop, the D3D12 call count and the last call.
+  `LEONIDA_D3D12=vulkan` and stops the process tree at `--timeout` (600 s). Each run gets a fresh overlay and
+  `LEONIDA_SAVE_DIR`, so what an earlier run wrote cannot change it. The traces stay in `<matrix>/<set>/runN/`;
+  `result.json` has the stop, the D3D12 call count and the last call.
 * The `Shaders` column compares the library's `translation_sources.sha256` (written by `make_game.py`) with the
   same digest over the tree: `stale` means the library came from another translator, a common reason a stop does
   not reproduce.

@@ -278,9 +278,10 @@ def tail(path: str, lines: int = TAIL_LINES) -> list[str]:
         return []
 
 
-def build_runtime(tree: str, log_path: str, config: str) -> tuple[bool, str | None]:
+def build_runtime(tree: str, log_path: str, config: str, cmake_args: list[str]) -> tuple[bool, str | None]:
+    """Configure and build gta6rt (and the TLS host DLL it depends on) in <tree>/runtime/build."""
     build = os.path.join(tree, "runtime", "build")
-    steps = (["cmake", "-S", os.path.join(tree, "runtime"), "-B", build],
+    steps = (["cmake", "-S", os.path.join(tree, "runtime"), "-B", build, *cmake_args],
              ["cmake", "--build", build, "--config", config, "--target", "gta6rt"])
     with open(log_path, "w", encoding="utf-8", newline="\n") as log:
         for step in steps:
@@ -319,7 +320,7 @@ def boot(command: list[str], run_dir: str, env: dict, timeout: float) -> dict:
     argv = [*command, "--trace", trace, "--trace-d3d12"]
     started = time.monotonic()
     with open(d3d12, "wb") as err, open(os.path.join(run_dir, "stdout.log"), "wb") as out:
-        proc = subprocess.Popen(argv, stdout=out, stderr=err, env={**os.environ, **env})
+        proc = subprocess.Popen(argv, stdout=out, stderr=err, env={**os.environ, **env}, cwd=run_dir)
         timed_out = False
         try:
             proc.wait(timeout=timeout)
@@ -387,7 +388,7 @@ def cmd_run(a: argparse.Namespace) -> int:
               "shaders": shader_library_state(a.shaders, tree_digest), "build": "skipped"}
     gta6rt = a.gta6rt
     if a.build:
-        ok, built = build_runtime(tree, os.path.join(run_dir, "build.log"), a.config)
+        ok, built = build_runtime(tree, os.path.join(run_dir, "build.log"), a.config, a.cmake_arg)
         result["build"] = "ok" if ok and built else "failed"
         if result["build"] == "failed":
             result["build_tail"] = tail(os.path.join(run_dir, "build.log"))
@@ -397,9 +398,15 @@ def cmd_run(a: argparse.Namespace) -> int:
         gta6rt = built
     if not gta6rt or not os.path.isfile(gta6rt):
         raise MatrixError("give --build or --gta6rt <path to gta6rt.exe>")
-    env = {"LEONIDA_D3D12": "vulkan", "LEONIDA_SHADERS": os.path.abspath(a.shaders)}
+    # A fresh overlay and save folder per run: what an earlier run wrote must not change this boot.
+    overlay = os.path.abspath(a.overlay) if a.overlay else os.path.join(run_dir, "overlay")
+    save = os.path.join(run_dir, "save")
+    os.makedirs(overlay, exist_ok=True)
+    os.makedirs(save, exist_ok=True)
+    env = {"LEONIDA_D3D12": "vulkan", "LEONIDA_SHADERS": os.path.abspath(a.shaders), "LEONIDA_SAVE_DIR": save}
     env.update(dict(a.env))
-    command = [gta6rt, "--run", a.exe, "--game-dir", a.game_dir]
+    command = [os.path.abspath(gta6rt), "--run", os.path.abspath(a.exe), "--game-dir", os.path.abspath(a.game_dir),
+               "--overlay", overlay]
     result.update(summarize_run(boot(command, run_dir, env, a.timeout)))
     write_json(os.path.join(run_dir, RESULT), result)
     print(f"{a.set} {result['run']}: {format_stop(result['stop'])}; {result['d3d12_calls']} D3D12 calls"
@@ -517,9 +524,13 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--shaders", required=True, help="<work>/shaders/spirv, passed as LEONIDA_SHADERS")
     r.add_argument("--build", action="store_true", help="configure and build runtime/ in the tree first")
     r.add_argument("--config", default="RelWithDebInfo", help="build configuration (RelWithDebInfo)")
+    r.add_argument("--cmake-arg", action="append", default=[], metavar="ARG",
+                   help="extra configure argument for --build, e.g. -GNinja or -DLEONIDA_VULKAN_HEADERS_FETCH=OFF "
+                        "on a machine without network (repeatable; use --cmake-arg=-G... for a leading dash)")
     r.add_argument("--gta6rt", help="an already built gta6rt.exe (instead of --build)")
     r.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help=f"seconds before the run is stopped "
                    f"({DEFAULT_TIMEOUT})")
+    r.add_argument("--overlay", help="gta6rt's --overlay (default: a fresh <run folder>/overlay)")
     r.add_argument("--env", action="append", default=[], type=parse_env, metavar="NAME=VALUE",
                    help="extra environment for gta6rt, e.g. LEONIDA_SKIP_INT3=1 (repeatable)")
     r.set_defaults(func=cmd_run)
