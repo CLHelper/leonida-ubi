@@ -188,8 +188,10 @@ python -I tools\boot_matrix.py report $matrix
 * The `Shaders` column compares the library's `translation_sources.sha256` (written by `make_game.py`) with the
   same digest over the tree: `stale` means the library came from another translator, a common reason a stop does
   not reproduce.
-* `report` prints the Markdown table. A `last exception` row is the last exception the trace recorded before the
-  process ended; exceptions are logged before handlers run, so it is where to look first, not proof of the cause.
+* `report` prints the Markdown table, with the newest run of each set's current head. A `last exception` row is the
+  last exception the trace recorded before the process ended; exceptions are logged before handlers run, so it is
+  where to look first, not proof of the cause. An `error` row quotes the loader's message on one line; read it
+  before posting, since it can name a path.
 
 ## 7. Limits
 
