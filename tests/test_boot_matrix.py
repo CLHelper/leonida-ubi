@@ -252,7 +252,11 @@ class RunTest(RepoCase):
         self.assertEqual(result["shaders"], "current")
         self.assertEqual(seen["env"]["LEONIDA_D3D12"], "vulkan")
         self.assertEqual(seen["env"]["LEONIDA_SKIP_INT3"], "1")
-        self.assertEqual(seen["command"][1:], ["--run", "title.exe", "--game-dir", "pkg"])
+        run_dir = os.path.join(self.out, "s", "run1")
+        self.assertEqual(seen["command"][1:], ["--run", os.path.abspath("title.exe"), "--game-dir",
+                                               os.path.abspath("pkg"), "--overlay", os.path.join(run_dir, "overlay")])
+        self.assertEqual(seen["env"]["LEONIDA_SAVE_DIR"], os.path.join(run_dir, "save"))
+        self.assertTrue(os.path.isdir(os.path.join(run_dir, "overlay")))
 
     def test_crash_names_the_last_exception(self):
         self.record_shaders("0" * 64)
