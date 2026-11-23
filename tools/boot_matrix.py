@@ -79,10 +79,14 @@ class MatrixError(Exception):
 # --- set specs and git ---------------------------------------------------------------------------------------------
 
 def parse_set(text: str) -> tuple[str, list[dict]]:
-    """`name=7286,8517:refs/x` -> ("name", [{"pr": 7286, "ref": "refs/boot-matrix/pr/7286"}, ...])."""
+    """`name=7286,8517:refs/x` -> ("name", [{"pr": 7286, "ref": "refs/boot-matrix/pr/7286"}, ...]).
+
+    `name=` is the base alone, the row the other sets are compared with."""
     name, sep, specs = text.partition("=")
-    if not sep or not SET_NAME.match(name) or not specs:
+    if not sep or not SET_NAME.match(name):
         raise argparse.ArgumentTypeError(f"expected NAME=PR[,PR...], got {text!r}")
+    if not specs:
+        return name, []
     prs = []
     for spec in specs.split(","):
         number, _, ref = spec.strip().partition(":")
@@ -175,7 +179,8 @@ def merge_set(repo: str, base: str, name: str, prs: list[dict], checks: dict, en
     rows = []
     for pr in prs:
         row = {"pr": pr["pr"], "ref": pr["ref"], "sha": pr["sha"], "verdict": checks[pr["pr"]]["verdict"],
-               "duplicates": sum(checks[pr["pr"]]["duplicates"].values()), "conflict_files": []}
+               "duplicates": sum(checks[pr["pr"]]["duplicates"].values()),
+               "conflicts_with_base": checks[pr["pr"]]["conflict"], "conflict_files": []}
         if row["verdict"] == "already-merged":
             row["status"] = "already-merged"
             rows.append(row)
@@ -225,7 +230,7 @@ def cmd_merge(a: argparse.Namespace) -> int:
     write_json(os.path.join(a.out, MATRIX), matrix)
     for s in matrix["sets"]:
         merged = sum(1 for p in s["prs"] if p["status"] == "merged")
-        skipped = [f"#{p['pr']} {p['status']}" for p in s["prs"] if p["status"] != "merged"]
+        skipped = [f"#{p['pr']} {skip_reason(p)}" for p in s["prs"] if p["status"] != "merged"]
         print(f"{s['name']}: {s['branch']} {s['head'][:12]}, {merged}/{len(s['prs'])} merged"
               + (f"; skipped {', '.join(skipped)}" if skipped else ""))
     conflicts = any(p["status"] == "conflict" for s in matrix["sets"] for p in s["prs"])
@@ -433,6 +438,13 @@ def latest_result(matrix_dir: str, name: str) -> dict | None:
     return read_json(os.path.join(set_dir, max(runs)[1], RESULT))
 
 
+def skip_reason(pr: dict) -> str:
+    """Why a PR is not in the set's head: already on the base, or which merge it conflicts with."""
+    if pr["status"] != "conflict":
+        return pr["status"]
+    return "conflicts with base" if pr.get("conflicts_with_base") else "conflicts with an earlier PR"
+
+
 def pr_cell(prs: list[dict], status: str) -> str:
     return " ".join(f"#{p['pr']}" for p in prs if p["status"] == status) or "-"
 
@@ -450,7 +462,7 @@ def format_markdown(matrix: dict, rows: list[dict]) -> str:
            "| Set | Head | Merged | Skipped | Build | Shaders | D3D12 calls | Last D3D12 call | Stop |",
            "|---|---|---|---|---|---|---|---|---|"]
     for row in rows:
-        skipped = " ".join(f"#{p['pr']} ({p['status']})" for p in row["prs"] if p["status"] != "merged") or "-"
+        skipped = " ".join(f"#{p['pr']} ({skip_reason(p)})" for p in row["prs"] if p["status"] != "merged") or "-"
         r = row["result"]
         if r is None:
             run = ["not run"] + ["-"] * 4
