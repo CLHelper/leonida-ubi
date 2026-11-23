@@ -211,7 +211,33 @@ order. It maps each question to the event to look for; it does not answer them.
   does not affect these outcomes.
 * `exit` is the game's own code, not the loader's. A crash after the first frame is the next layer question.
 
-## 6. Limits
+## 6. Which pull requests a stop depends on
+
+A stop is only comparable with someone else's when both name the same base, the same pull requests in the same
+order, and a shader library made by the same translator. `tools/boot_matrix.py` makes that one row per named set:
+
+```powershell
+python -I tools\boot_matrix.py merge --base origin/main --fetch origin --out $matrix `
+    --set rt5=7286,8517 --set rt5-plus=7286,8517,6891
+# check out or export boot-matrix/rt5 where you build, then, per set:
+python -I tools\boot_matrix.py run $matrix --set rt5 --tree $tree --exe $exe --game-dir $pkg `
+    --shaders $work\shaders\spirv --build
+python -I tools\boot_matrix.py report $matrix
+```
+
+* `merge` only runs git (`merge-tree --write-tree`, `commit-tree`): no checkout, nothing from a pull request runs.
+  A PR that `scripts/merge_check.py` finds already on the base is skipped, so is one that conflicts with an earlier
+  PR in the set (its files are listed). Each set becomes the branch `boot-matrix/<set>`.
+* `run` builds `runtime/` in the tree (or takes `--gta6rt`), runs `--run --trace --trace-d3d12` with
+  `LEONIDA_D3D12=vulkan` and stops the process tree at `--timeout` (600 s). The traces stay in
+  `<matrix>/<set>/runN/`; `result.json` has the stop, the D3D12 call count and the last call.
+* The `Shaders` column compares the library's `translation_sources.sha256` (written by `make_game.py`) with the
+  same digest over the tree: `stale` means the library came from another translator, a common reason a stop does
+  not reproduce.
+* `report` prints the Markdown table. A `last exception` row is the last exception the trace recorded before the
+  process ended; exceptions are logged before handlers run, so it is where to look first, not proof of the cause.
+
+## 7. Limits
 
 The retail executable is not in the package, so this page is untested against it; the tool and the trace formats
 are tested on synthetic fixtures and on `tiny_game` (which has no D3D12 calls). The present slots (Q6) and the
