@@ -10,6 +10,7 @@ a crash after an access violation, and a run that is still going when the timeou
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -124,7 +125,7 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(bm.parse_set("main="), ("main", []))
 
     def test_bad_specs(self):
-        for text in ("rt5", "=1", "a b=1", "rt5=x", "rt5=1,1", "rt5=1,"):
+        for text in ("rt5", "=1", "a b=1", "rt5=x", "rt5=1,1", "rt5=1,", "a..b=1", "x.lock=1", "trail.=1"):
             with self.subTest(text=text), self.assertRaises(Exception):
                 bm.parse_set(text)
 
@@ -200,6 +201,16 @@ class MergeTest(RepoCase):
         self.assertEqual(matrix["sets"][1]["translation_digest"], base_digest)
         self.assertEqual(bm.digest_of_tree(self.repo), base_digest)
 
+    def test_one_ref_per_pr_and_names_without_case(self):
+        self.pr(1, "runtime/a.txt", "a\n")
+        self.git("update-ref", "refs/heads/other", "main")
+        for sets in (["a=1", "b=1:refs/heads/other"], ["rt5=1", "RT5=1"]):
+            with self.subTest(sets=sets), mock.patch("sys.stderr", io.StringIO()):
+                args = ["merge", "--repo", self.repo, "--base", "main", "--out", os.path.join(self.tmp, "m")]
+                for s in sets:
+                    args += ["--set", s]
+                self.assertEqual(bm.main(args), 2)
+
     def test_missing_ref_is_a_usage_error(self):
         err = io.StringIO()
         with mock.patch("sys.stderr", err):
@@ -224,7 +235,7 @@ class RunTest(RepoCase):
         with open(os.path.join(self.shaders, "translation_sources.sha256"), "w", encoding="utf-8") as f:
             f.write(digest + "\n")
 
-    def run_set(self, mode, timeout=30, expect=0):
+    def run_set(self, mode, timeout=30, expect=0, matrix=None):
         real_boot = bm.boot
         seen = {}
 
@@ -235,12 +246,12 @@ class RunTest(RepoCase):
 
         gta6rt = os.path.join(self.tmp, "gta6rt.exe")
         open(gta6rt, "wb").close()
-        args = ["run", self.out, "--set", "s", "--tree", self.repo, "--exe", "title.exe", "--game-dir", "pkg",
+        args = ["run", matrix or self.out, "--set", "s", "--tree", self.repo, "--exe", "title.exe", "--game-dir", "pkg",
                 "--shaders", self.shaders, "--gta6rt", gta6rt, "--timeout", str(timeout),
                 "--env", "LEONIDA_SKIP_INT3=1"]
         with mock.patch.object(bm, "boot", fake_boot), redirect_stdout(io.StringIO()):
             self.assertEqual(bm.main(args), expect)
-        return bm.latest_result(self.out, "s"), seen
+        return bm.latest_result(self.out, "s", self.matrix["sets"][0]["head"]), seen
 
     def test_exit(self):
         self.record_shaders(bm.digest_of_tree(self.repo))
@@ -284,9 +295,49 @@ class RunTest(RepoCase):
         self.assertIn("| s | `" + self.matrix["sets"][0]["head"][:12] + "` | #1 | - | skipped | unknown | 3 | "
                       "`#3 ExecuteCommandLists ok` | exit 0 |", text)
 
+    def test_relative_matrix_folder(self):
+        """gta6rt runs in the run folder, so a relative matrix path must not reach it as a relative trace path."""
+        cwd = os.getcwd()
+        os.chdir(self.tmp)
+        self.addCleanup(os.chdir, cwd)
+        result, _ = self.run_set("exit", matrix=os.path.relpath(self.out, self.tmp))
+        self.assertEqual(result["stop"]["kind"], "exit")
+
+    def test_report_ignores_runs_of_an_older_head(self):
+        self.run_set("exit")
+        path = os.path.join(self.out, bm.MATRIX)
+        self.matrix["sets"][0]["head"] = "f" * 40   # merged again, the set moved on
+        bm.write_json(path, self.matrix)
+        matrix, rows = bm.report_rows(self.out)
+        self.assertIsNone(rows[0]["result"])
+        self.assertIn("| not run |", bm.format_markdown(matrix, rows))
+
     def test_no_trace(self):
         stop = bm.classify(None, False, 1)
         self.assertEqual(bm.format_stop(stop), "no trace (process exit 1)")
+
+
+class ClassifyTest(unittest.TestCase):
+    @staticmethod
+    def startup(**fields):
+        trace = {"exception_count": 0, "exceptions": [], "unimplemented": [], "exit": None, "error": None}
+        trace.update(fields)
+        return trace
+
+    def test_loader_error_wins_over_an_earlier_handled_exception(self):
+        exc = {"code": "0x406d1388", "at": "title.exe+0x10"}
+        stop = bm.classify(self.startup(exception_count=1, exceptions=[exc], error="bad image"), False, 1)
+        self.assertEqual(stop["kind"], "error")
+
+    def test_error_text_stays_one_table_cell(self):
+        stop = {"kind": "error", "what": "a | b\nc " + "x" * 300}
+        text = bm.format_stop(stop)
+        self.assertNotIn("\n", text)
+        self.assertLessEqual(len(text), len("error: ") + bm.CELL_LIMIT + 3)
+        row = {"set": "s", "head": "1" * 40, "prs": [],
+               "result": {"build": "ok", "shaders": "current", "stop": stop}}
+        line = bm.format_markdown({"base": {"sha": "0" * 40, "ref": "main"}}, [row]).splitlines()[-1]
+        self.assertEqual(len(re.findall(r"(?<!\\)\|", line)), 10)   # nine cells, nothing split
 
 
 class ReportTest(RepoCase):

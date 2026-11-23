@@ -31,9 +31,10 @@ reported stop does not reproduce.
 
 What a row says: `exit N` (the entry point returned), `running at timeout` (still going when stopped), `last
 exception CODE at SITE` (the process ended without an exit event; exceptions are recorded before handlers run, so
-the last one is where to look first, not proof of the cause), `error` (the loader threw) or `no trace`. Rows carry
-counts, RVAs, method and import names only; the traces stay in the matrix folder on your machine (AGENTS.md, "No
-game data"), and failed file paths and debug strings are left out of the report.
+the last one is where to look first, not proof of the cause), `error` (the loader threw; its message, shortened to one
+line) or `no trace`. Otherwise rows carry counts, RVAs, method and import names; the traces stay in the matrix folder
+on your machine (AGENTS.md, "No game data"), and failed file paths and debug strings are left out of the report.
+Read an `error` row before you post it: the message is the loader's own text and can name a path.
 
 Standard library only; needs git 2.38 or newer for `merge-tree --write-tree`. Exit 0 on success, 1 when a set had a
 conflict or a run did not reach a trace, 2 on a usage, git or file error.
@@ -63,12 +64,11 @@ MATRIX = "matrix.json"
 RESULT = "result.json"
 PR_REF = "refs/boot-matrix/pr/{}"
 BRANCH = "boot-matrix/{}"
-SET_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+SET_NAME = re.compile(r"^(?!.*\.\.)(?!.*\.lock$)[A-Za-z0-9][A-Za-z0-9._-]*(?<!\.)$")
 MERGE_AUTHOR = {"GIT_AUTHOR_NAME": "boot_matrix", "GIT_AUTHOR_EMAIL": "boot-matrix@invalid",
                 "GIT_COMMITTER_NAME": "boot_matrix", "GIT_COMMITTER_EMAIL": "boot-matrix@invalid"}
 DEFAULT_TIMEOUT = 600   # seconds; the retail boot reaches its frame loop well within this on a desktop GPU
-GTA6RT_PATHS = ("gta6rt.exe", os.path.join("RelWithDebInfo", "gta6rt.exe"), os.path.join("Release", "gta6rt.exe"),
-                os.path.join("Debug", "gta6rt.exe"))
+CELL_LIMIT = 160   # characters of loader error text in a table cell
 TAIL_LINES = 20
 
 
@@ -207,8 +207,8 @@ def merge_set(repo: str, base: str, name: str, prs: list[dict], checks: dict, en
 def cmd_merge(a: argparse.Namespace) -> int:
     repo = os.path.abspath(a.repo)
     sets = dict(a.set)
-    if len(sets) != len(a.set):
-        raise MatrixError("two sets share a name")
+    if len({name.lower() for name in sets}) != len(a.set):
+        raise MatrixError("two sets share a name (names are compared without case: they are folders too)")
     numbers = sorted({p["pr"] for prs in sets.values() for p in prs if p["ref"] == PR_REF.format(p["pr"])})
     if a.fetch and numbers:
         fetch(repo, a.fetch, numbers)
@@ -216,7 +216,11 @@ def cmd_merge(a: argparse.Namespace) -> int:
     for prs in sets.values():
         for pr in prs:
             pr["sha"] = rev(repo, pr["ref"])
-    unique = {pr["pr"]: pr["sha"] for prs in sets.values() for pr in prs}
+    unique = {}
+    for prs in sets.values():
+        for pr in prs:
+            if unique.setdefault(pr["pr"], pr["sha"]) != pr["sha"]:
+                raise MatrixError(f"#{pr['pr']} is given two different refs; use one per PR number")
     try:
         history = merge_check.prior_merges(repo, base, unique, a.depth)
         checks = {n: merge_check.check(repo, base, n, sha, a.min_length, history[n]) for n, sha in unique.items()}
@@ -294,12 +298,12 @@ def build_runtime(tree: str, log_path: str, config: str, cmake_args: list[str]) 
                 return False, None
             if r.returncode != 0:
                 return False, None
-    return True, find_gta6rt(build)
+    return True, find_gta6rt(build, config)
 
 
-def find_gta6rt(build: str) -> str | None:
-    for rel in GTA6RT_PATHS:
-        path = os.path.join(build, rel)
+def find_gta6rt(build: str, config: str) -> str | None:
+    """A single-config generator (Ninja) puts it in the build folder, a multi-config one under <config>."""
+    for path in (os.path.join(build, "gta6rt.exe"), os.path.join(build, config, "gta6rt.exe")):
         if os.path.isfile(path):
             return path
     return None
@@ -311,7 +315,10 @@ def stop_tree(proc: subprocess.Popen) -> None:
         subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
     if proc.poll() is None:
         proc.kill()
-    proc.wait()
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def boot(command: list[str], run_dir: str, env: dict, timeout: float) -> dict:
@@ -327,6 +334,9 @@ def boot(command: list[str], run_dir: str, env: dict, timeout: float) -> dict:
         except subprocess.TimeoutExpired:
             timed_out = True
             stop_tree(proc)
+        except BaseException:   # Ctrl-C: do not leave gta6rt and its suspended child running
+            stop_tree(proc)
+            raise
     return {"returncode": None if timed_out else proc.returncode, "timed_out": timed_out,
             "seconds": round(time.monotonic() - started, 1), "trace": trace, "d3d12": d3d12}
 
@@ -352,13 +362,13 @@ def classify(startup: dict | None, timed_out: bool, returncode: int | None) -> d
     last = startup["exceptions"][-1] if startup["exceptions"] else None
     if startup["exit"] is not None:
         stop.update(kind="exit", code=startup["exit"])
+    elif startup["error"]:
+        stop.update(kind="error", what=startup["error"], returncode=returncode)
     elif timed_out:
         stop.update(kind="running at timeout")
     elif last:
         stop.update(kind="last exception", code=last["code"], at=last["at"], access=last.get("access"),
                     address=last.get("address"), returncode=returncode)
-    elif startup["error"]:
-        stop.update(kind="error", what=startup["error"], returncode=returncode)
     else:
         stop.update(kind="ended without exit event", returncode=returncode)
     return stop
@@ -378,6 +388,7 @@ def summarize_run(outcome: dict) -> dict:
 
 
 def cmd_run(a: argparse.Namespace) -> int:
+    a.matrix = os.path.abspath(a.matrix)   # gta6rt runs in the run folder, so every path it gets is absolute
     matrix = read_json(os.path.join(a.matrix, MATRIX))
     entry = find_set(matrix, a.set)
     tree = os.path.abspath(a.tree)
@@ -426,13 +437,15 @@ def format_stop(stop: dict) -> str:
             text += f" ({stop['access']}" + (f" {stop['address']}" if stop.get("address") else "") + ")"
         return text
     if kind == "error":
-        return f"error: {stop['what']}"
+        what = " ".join(str(stop["what"]).split())
+        return "error: " + (what[:CELL_LIMIT] + "..." if len(what) > CELL_LIMIT else what)
     if stop.get("returncode") is not None:
         return f"{kind} (process exit {stop['returncode']})"
     return kind
 
 
-def latest_result(matrix_dir: str, name: str) -> dict | None:
+def latest_result(matrix_dir: str, name: str, head: str) -> dict | None:
+    """The newest run of the set's current head; runs of an earlier merge of the same name are ignored."""
     set_dir = os.path.join(matrix_dir, name)
     runs = []
     if os.path.isdir(set_dir):
@@ -440,9 +453,11 @@ def latest_result(matrix_dir: str, name: str) -> dict | None:
             m = re.fullmatch(r"run(\d+)", entry)
             if m and os.path.isfile(os.path.join(set_dir, entry, RESULT)):
                 runs.append((int(m.group(1)), entry))
-    if not runs:
-        return None
-    return read_json(os.path.join(set_dir, max(runs)[1], RESULT))
+    for _, entry in sorted(runs, reverse=True):
+        result = read_json(os.path.join(set_dir, entry, RESULT))
+        if result.get("head") == head:
+            return result
+    return None
 
 
 def skip_reason(pr: dict) -> str:
@@ -460,7 +475,7 @@ def report_rows(matrix_dir: str) -> tuple[dict, list[dict]]:
     matrix = read_json(os.path.join(matrix_dir, MATRIX))
     rows = []
     for s in matrix["sets"]:
-        rows.append({"set": s["name"], "head": s["head"], "prs": s["prs"], "result": latest_result(matrix_dir, s["name"])})
+        rows.append({"set": s["name"], "head": s["head"], "prs": s["prs"], "result": latest_result(matrix_dir, s["name"], s["head"])})
     return matrix, rows
 
 
@@ -477,8 +492,8 @@ def format_markdown(matrix: dict, rows: list[dict]) -> str:
             last = f"`{r['last_d3d12_call']}`" if r.get("last_d3d12_call") else "-"
             stop = format_stop(r["stop"]) if "stop" in r else "-"
             run = [r["build"], r["shaders"], str(r.get("d3d12_calls", "-")), last, stop]
-        out.append("| " + " | ".join([row["set"], f"`{row['head'][:12]}`", pr_cell(row["prs"], "merged"), skipped,
-                                       *run]) + " |")
+        cells = [row["set"], f"`{row['head'][:12]}`", pr_cell(row["prs"], "merged"), skipped, *run]
+        out.append("| " + " | ".join(cell.replace("|", "\\|") for cell in cells) + " |")
     return "\n".join(out)
 
 
@@ -554,6 +569,12 @@ def main(argv: list[str] | None = None) -> int:
         return a.func(a)
     except MatrixError as e:
         print(f"boot_matrix: {e}", file=sys.stderr)
+        return 2
+    except OSError as e:   # an unwritable matrix folder, a gta6rt or exe that cannot be started
+        print(f"boot_matrix: {e.filename or ''}: {e.strerror or e}", file=sys.stderr)
+        return 2
+    except (KeyError, TypeError) as e:   # a matrix.json or result.json this version did not write
+        print(f"boot_matrix: unexpected matrix or result file ({type(e).__name__}: {e})", file=sys.stderr)
         return 2
 
 
