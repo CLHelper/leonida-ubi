@@ -218,7 +218,7 @@ order, and a shader library made by the same translator. `tools/boot_matrix.py` 
 
 ```powershell
 python -I tools\boot_matrix.py merge --base origin/main --fetch origin --out $matrix `
-    --set main= --set rt5=7286,8517 --set rt5-plus=7286,8517,6891
+    --set main= --set rt5=445 --set rt5-plus=445,565
 # check out or export boot-matrix/rt5 where you build, then, per set:
 python -I tools\boot_matrix.py run $matrix --set rt5 --tree $tree --exe $exe --game-dir $pkg `
     --shaders $work\shaders\spirv --build
