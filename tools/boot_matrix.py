@@ -4,7 +4,7 @@ Boot work on RT-5 is spread over many open pull requests, and the stop a contrib
 them were merged, in which order, onto which `main`, and on whether the shader library matched the translator. This
 tool makes that explicit in three steps:
 
-    python -I tools/boot_matrix.py merge --base origin/main --set rt5=7286,8517 --set rt5-6891=7286,8517,6891 \\
+    python -I tools/boot_matrix.py merge --base origin/main --set rt5=445 --set rt5-565=445,565 \\
         --fetch origin --out <matrix folder>
     python -I tools/boot_matrix.py run <matrix folder> --set rt5 --tree <that set's checkout or export> \\
         --exe <game_scarlett_master.exe> --game-dir <package> --shaders <work>/shaders/spirv --build
