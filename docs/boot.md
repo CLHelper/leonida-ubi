@@ -230,17 +230,23 @@ python -I tools\boot_matrix.py report $matrix
   PR in the set (its files are listed, and whether it conflicts with the base itself or only with the PRs before
   it). Each set becomes the branch `boot-matrix/<set>`; an empty set (`main=`) is the base alone, the row to compare
   the others with.
-* `run` builds `runtime/` in the tree (or takes `--gta6rt`), runs `--run --trace --trace-d3d12` with
-  `LEONIDA_D3D12=vulkan` and stops the process tree at `--timeout` (600 s). Each run gets a fresh overlay and
-  `LEONIDA_SAVE_DIR`, so what an earlier run wrote cannot change it. The traces stay in `<matrix>/<set>/runN/`;
-  `result.json` has the stop, the D3D12 call count and the last call.
+* `run` first checks that the tree holds the set's head: `merge` writes the blob id of every file of that head to
+  `<matrix>/<set>/files.json`, and a tree that lacks one of them or holds other content stops the run (exit 2) before
+  anything is built. CRLF line ends count as the same file; files the head does not have (a build folder) are not
+  looked at. It then builds `runtime/` in the tree, or takes `--gta6rt`: such a run is recorded as built
+  `prebuilt (unverified)`, since nothing shows which source the binary came from. It runs `--run --trace
+  --trace-d3d12` with `LEONIDA_D3D12=vulkan` and stops the process tree at `--timeout` (600 s). Each run gets a fresh
+  overlay and `LEONIDA_SAVE_DIR`, so what an earlier run wrote cannot change it. The traces stay in
+  `<matrix>/<set>/runN/`; `result.json` has the stop, the D3D12 call count and the last call.
 * The `Shaders` column compares the library's `translation_sources.sha256` (written by `make_game.py`) with the
   same digest over the tree: `stale` means the library came from another translator, a common reason a stop does
   not reproduce.
-* `report` prints the Markdown table, with the newest run of each set's current head. A `last exception` row is the
-  last exception the trace recorded before the process ended; exceptions are logged before handlers run, so it is
-  where to look first, not proof of the cause. An `error` row quotes the loader's message on one line; read it
-  before posting, since it can name a path.
+* `report` prints the Markdown table (or `--json`), with the newest run of each set's current head. Both pass on
+  only a fixed list of fields: the stop's kind, exception code, module+RVA and access kind, the counts, and the last
+  D3D12 call as number, method and result. The access address, the loader's error message (it can name a path) and
+  the call's arguments stay in `result.json` on your machine. A `last exception` row is the last exception the trace
+  recorded before the process ended; exceptions are logged before handlers run, so it is where to look first, not
+  proof of the cause.
 
 ## 7. Limits
 

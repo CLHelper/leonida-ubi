@@ -5,7 +5,8 @@
 The merge cases build a base and pull request branches, one of them already merged into the base and one that
 conflicts with an earlier PR in the set, and check the statuses, the branch and that the working tree is untouched.
 The run cases boot a small Python script that writes synthetic startup and D3D12 traces the way gta6rt does: an exit,
-a crash after an access violation, and a run that is still going when the timeout stops it.
+a crash after an access violation, and a run that is still going when the timeout stops it. They also check that a
+tree which is not the set's head is refused, and that a report leaves out addresses, paths and call arguments.
 """
 import io
 import json
@@ -16,6 +17,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+import zipfile
 from contextlib import redirect_stdout
 from unittest import mock
 
@@ -40,8 +42,9 @@ FAKE_GTA6RT = textwrap.dedent('''\
         for e in events:
             f.write(json.dumps(e) + "\\n")
         f.flush()
-        for seq, method in enumerate(["CreateCommandQueue", "CreateFence", "ExecuteCommandLists"], 1):
-            sys.stderr.write(f"[d3d12-trace] #{seq} {method} ok\\n")
+        calls = ["CreateCommandQueue", "CreateFence", "ExecuteCommandLists count=1 queue=0x7ff6a0b0"]
+        for seq, call in enumerate(calls, 1):
+            sys.stderr.write(f"[d3d12-trace] #{seq} {call} ok\\n")
         sys.stderr.write("[rt] d3d12: a diagnostic line\\n")
         sys.stderr.flush()
         if mode == "exit":
@@ -230,12 +233,13 @@ class RunTest(RepoCase):
             f.write(FAKE_GTA6RT)
         self.shaders = os.path.join(self.tmp, "spirv")
         os.makedirs(self.shaders)
+        self.git("checkout", "-q", "boot-matrix/s")   # the tree a run builds holds the set's head
 
     def record_shaders(self, digest):
         with open(os.path.join(self.shaders, "translation_sources.sha256"), "w", encoding="utf-8") as f:
             f.write(digest + "\n")
 
-    def run_set(self, mode, timeout=30, expect=0, matrix=None):
+    def run_set(self, mode, timeout=30, expect=0, matrix=None, tree=None):
         real_boot = bm.boot
         seen = {}
 
@@ -246,12 +250,59 @@ class RunTest(RepoCase):
 
         gta6rt = os.path.join(self.tmp, "gta6rt.exe")
         open(gta6rt, "wb").close()
-        args = ["run", matrix or self.out, "--set", "s", "--tree", self.repo, "--exe", "title.exe", "--game-dir", "pkg",
-                "--shaders", self.shaders, "--gta6rt", gta6rt, "--timeout", str(timeout),
+        args = ["run", matrix or self.out, "--set", "s", "--tree", tree or self.repo, "--exe", "title.exe",
+                "--game-dir", "pkg", "--shaders", self.shaders, "--gta6rt", gta6rt, "--timeout", str(timeout),
                 "--env", "LEONIDA_SKIP_INT3=1"]
-        with mock.patch.object(bm, "boot", fake_boot), redirect_stdout(io.StringIO()):
-            self.assertEqual(bm.main(args), expect)
+        err = io.StringIO()
+        with mock.patch.object(bm, "boot", fake_boot), redirect_stdout(io.StringIO()), mock.patch("sys.stderr", err):
+            self.assertEqual(bm.main(args), expect, err.getvalue())
+        seen["stderr"] = err.getvalue()
         return bm.latest_result(self.out, "s", self.matrix["sets"][0]["head"]), seen
+
+    def export(self):
+        """The set's head as `git archive` writes it, the way a tree for another user or machine is made."""
+        tree = os.path.join(self.tmp, "export")
+        os.makedirs(tree)
+        archive = os.path.join(self.tmp, "head.zip")
+        self.git("archive", "--format=zip", "-o", archive, self.matrix["sets"][0]["head"])
+        with zipfile.ZipFile(archive) as z:
+            z.extractall(tree)
+        return tree
+
+    def assert_refused(self, tree, *names):
+        _, seen = self.run_set("exit", expect=2, tree=tree)
+        for name in names:
+            self.assertIn(name, seen["stderr"])
+        self.assertFalse(os.path.exists(os.path.join(self.out, "s", "run1")), "a refused tree must not start a run")
+
+    def test_checkout_at_another_commit_is_refused(self):
+        self.git("checkout", "-q", "main")
+        self.assert_refused(self.repo, "runtime/slot10.txt (missing)", "boot-matrix/s")
+
+    def test_changed_file_is_refused(self):
+        self.write("runtime/slot10.txt", "unwrap, edited locally\n")
+        self.assert_refused(self.repo, "runtime/slot10.txt (differs)")
+
+    def test_export_with_crlf_and_a_build_folder_runs(self):
+        tree = self.export()
+        path = os.path.join(tree, "runtime", "slots.txt")
+        with open(path, "rb") as f:
+            data = f.read()
+        with open(path, "wb") as f:
+            f.write(data.replace(b"\n", b"\r\n"))
+        os.makedirs(os.path.join(tree, "runtime", "build"))
+        open(os.path.join(tree, "runtime", "build", "gta6rt.exe"), "wb").close()
+        result, _ = self.run_set("exit", tree=tree)
+        self.assertEqual(result["stop"]["kind"], "exit")
+
+    def test_export_missing_a_file_is_refused(self):
+        tree = self.export()
+        os.remove(os.path.join(tree, "make_game.py"))
+        self.assert_refused(tree, "make_game.py (missing)")
+
+    def test_matrix_without_file_list_asks_for_a_new_merge(self):
+        os.remove(os.path.join(self.out, "s", bm.FILES))
+        self.assert_refused(self.repo, "merge again")
 
     def test_exit(self):
         self.record_shaders(bm.digest_of_tree(self.repo))
@@ -259,7 +310,9 @@ class RunTest(RepoCase):
         self.assertEqual(result["stop"]["kind"], "exit")
         self.assertEqual(result["stop"]["code"], 0)
         self.assertEqual(result["d3d12_calls"], 3)
-        self.assertEqual(result["last_d3d12_call"], "#3 ExecuteCommandLists ok")
+        self.assertEqual(result["last_d3d12_call"], "#3 ExecuteCommandLists count=1 queue=0x7ff6a0b0 ok")
+        self.assertEqual(result["last_d3d12_method"], "#3 ExecuteCommandLists ok")
+        self.assertEqual(result["build"], bm.PREBUILT)
         self.assertEqual(result["shaders"], "current")
         self.assertEqual(seen["env"]["LEONIDA_D3D12"], "vulkan")
         self.assertEqual(seen["env"]["LEONIDA_SKIP_INT3"], "1")
@@ -276,9 +329,9 @@ class RunTest(RepoCase):
         self.assertEqual((stop["kind"], stop["code"], stop["at"]), ("last exception", "0xc0000005",
                                                                      "title.exe+0x4fb0aec"))
         self.assertEqual(stop["returncode"], 3)
+        self.assertEqual(stop["address"], "0xffffffffffffffff")   # kept in result.json, left out of reports
         self.assertEqual(result["shaders"], "stale")
-        self.assertEqual(bm.format_stop(stop),
-                         "last exception 0xc0000005 at title.exe+0x4fb0aec (read 0xffffffffffffffff)")
+        self.assertEqual(bm.format_stop(stop), "last exception 0xc0000005 at title.exe+0x4fb0aec (read)")
 
     def test_timeout_stops_the_run(self):
         result, _ = self.run_set("hang", timeout=3)
@@ -292,8 +345,21 @@ class RunTest(RepoCase):
         self.assertTrue(os.path.isdir(os.path.join(self.out, "s", "run2")))
         matrix, rows = bm.report_rows(self.out)
         text = bm.format_markdown(matrix, rows)
-        self.assertIn("| s | `" + self.matrix["sets"][0]["head"][:12] + "` | #1 | - | skipped | unknown | 3 | "
-                      "`#3 ExecuteCommandLists ok` | exit 0 |", text)
+        self.assertIn("| s | `" + self.matrix["sets"][0]["head"][:12] + "` | #1 | - | prebuilt (unverified) | "
+                      "unknown | 3 | `#3 ExecuteCommandLists ok` | exit 0 |", text)
+
+    def test_report_leaves_out_addresses_and_call_arguments(self):
+        self.run_set("crash")
+        matrix, rows = bm.report_rows(self.out)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(bm.main(["report", self.out, "--json"]), 0)
+        for text in (bm.format_markdown(matrix, rows), out.getvalue()):
+            with self.subTest(text=text[:40]):
+                self.assertIn("ExecuteCommandLists", text)
+                self.assertIn("title.exe+0x4fb0aec", text)
+                self.assertNotIn("0xffffffffffffffff", text)
+                self.assertNotIn("queue=0x7ff6a0b0", text)
 
     def test_relative_matrix_folder(self):
         """gta6rt runs in the run folder, so a relative matrix path must not reach it as a relative trace path."""
@@ -329,14 +395,17 @@ class ClassifyTest(unittest.TestCase):
         stop = bm.classify(self.startup(exception_count=1, exceptions=[exc], error="bad image"), False, 1)
         self.assertEqual(stop["kind"], "error")
 
-    def test_error_text_stays_one_table_cell(self):
-        stop = {"kind": "error", "what": "a | b\nc " + "x" * 300}
-        text = bm.format_stop(stop)
-        self.assertNotIn("\n", text)
-        self.assertLessEqual(len(text), len("error: ") + bm.CELL_LIMIT + 3)
-        row = {"set": "s", "head": "1" * 40, "prs": [],
-               "result": {"build": "ok", "shaders": "current", "stop": stop}}
+    def test_loader_message_stays_out_of_the_report(self):
+        path = "C:\\Users\\someone\\games\\pkg\\title.exe"
+        stop = {"kind": "error", "what": f"cannot map | {path}\nsecond line", "returncode": 1}
+        result = {"run": "run1", "build": "ok", "shaders": "current", "stop": stop, "last_d3d12_call": None}
+        shared = bm.shareable(result)
+        self.assertNotIn("what", shared["stop"])
+        self.assertNotIn("last_d3d12_call", shared)
+        row = {"set": "s", "head": "1" * 40, "prs": [], "result": shared}
         line = bm.format_markdown({"base": {"sha": "0" * 40, "ref": "main"}}, [row]).splitlines()[-1]
+        self.assertNotIn("someone", line)
+        self.assertIn("error (the loader's message is in result.json)", line)
         self.assertEqual(len(re.findall(r"(?<!\\)\|", line)), 10)   # nine cells, nothing split
 
 

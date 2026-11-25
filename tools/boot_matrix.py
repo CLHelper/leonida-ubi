@@ -19,22 +19,27 @@ its conflicted files listed. The result is the branch `boot-matrix/<set>` and `<
 The merge commits use a fixed author and the base's commit date, so the same inputs give the same commit.
 
 `run` builds and boots one set's tree: export or check out `boot-matrix/<set>` where you build PR code (another
-machine, a separate user), and point `--tree` at it. With `--build` it configures and builds `runtime/` there; else
-`--gta6rt` names the executable. It runs `gta6rt --run --trace --trace-d3d12` with `LEONIDA_D3D12=vulkan` and
+machine, a separate user), and point `--tree` at it. The tree must hold the set's head: `merge` writes the blob id of
+every file of that head to `<out>/<set>/files.json`, and `run` stops (exit 2) when a file is missing from the tree or
+differs from it (CRLF line ends aside; files the head does not have, such as a build folder, are ignored). With
+`--build` it configures and builds `runtime/` there; else `--gta6rt` names the executable, and the run is recorded as
+built `prebuilt (unverified)`: nothing shows which source that binary came from. It runs `gta6rt --run --trace --trace-d3d12` with `LEONIDA_D3D12=vulkan` and
 `LEONIDA_SHADERS`, stops the process tree at `--timeout`, and writes `<out>/<set>/runN/result.json`: the stop, the
 D3D12 call count and last call (summarised with `tools/boot_trace.py`), and whether the shader library was
 translated by this tree's translator (`translation_sources.sha256` that `make_game.py` writes beside it, against
 the same digest over the tree's `TRANSLATION_SOURCES`). A library from another translator is the usual reason a
 reported stop does not reproduce.
 
-`report` prints a Markdown table (or `--json`) with the newest run of each set, ready to paste into an issue.
+`report` prints a Markdown table (or `--json`) with the newest run of each set. Both carry only fields from a fixed
+list, so they can be shared: the stop's kind, exception code, module+RVA and access kind, counts, and the last D3D12
+call as its number, method and result. Left out: the access address, the loader's error message (it can name a path)
+and the D3D12 call's arguments. They stay in each run's `result.json` and traces on your machine (AGENTS.md, "No
+game data").
 
 What a row says: `exit N` (the entry point returned), `running at timeout` (still going when stopped), `last
 exception CODE at SITE` (the process ended without an exit event; exceptions are recorded before handlers run, so
-the last one is where to look first, not proof of the cause), `error` (the loader threw; its message, shortened to one
-line) or `no trace`. Otherwise rows carry counts, RVAs, method and import names; the traces stay in the matrix folder
-on your machine (AGENTS.md, "No game data"), and failed file paths and debug strings are left out of the report.
-Read an `error` row before you post it: the message is the loader's own text and can name a path.
+the last one is where to look first, not proof of the cause), `error` (the loader threw; its message is in
+`result.json`) or `no trace`.
 
 Standard library only; needs git 2.38 or newer for `merge-tree --write-tree`. Exit 0 on success, 1 when a set had a
 conflict or a run did not reach a trace, 2 on a usage, git or file error.
@@ -62,14 +67,20 @@ import merge_check  # noqa: E402
 
 MATRIX = "matrix.json"
 RESULT = "result.json"
+FILES = "files.json"   # per set: the blob id of every file of its head, to check the tree a run builds
+SHOWN_LIMIT = 5   # differing files named when a tree is refused
 PR_REF = "refs/boot-matrix/pr/{}"
 BRANCH = "boot-matrix/{}"
 SET_NAME = re.compile(r"^(?!.*\.\.)(?!.*\.lock$)[A-Za-z0-9][A-Za-z0-9._-]*(?<!\.)$")
 MERGE_AUTHOR = {"GIT_AUTHOR_NAME": "boot_matrix", "GIT_AUTHOR_EMAIL": "boot-matrix@invalid",
                 "GIT_COMMITTER_NAME": "boot_matrix", "GIT_COMMITTER_EMAIL": "boot-matrix@invalid"}
 DEFAULT_TIMEOUT = 600   # seconds; the retail boot reaches its frame loop well within this on a desktop GPU
-CELL_LIMIT = 160   # characters of loader error text in a table cell
 TAIL_LINES = 20
+PREBUILT = "prebuilt (unverified)"
+# What `report` passes on from a result.json and from its stop; everything else stays on the machine.
+SHARED_RESULT = ("run", "head", "build", "shaders", "translator_matches_set", "d3d12_calls", "last_d3d12_method",
+                 "seconds")
+SHARED_STOP = ("kind", "code", "at", "access", "exceptions", "unimplemented", "returncode")
 
 
 class MatrixError(Exception):
@@ -172,6 +183,64 @@ def shader_library_state(shaders: str, tree_digest: str) -> str:
     return "current" if recorded == tree_digest else "stale"
 
 
+# --- the files of a set's head, to check the tree a run builds -----------------------------------------------------
+
+def head_files(repo: str, head: str) -> dict:
+    """{"head", "object_format", "files": {path: blob id}} for the regular files of head (no links, no submodules)."""
+    fmt = git(repo, "rev-parse", "--show-object-format", check=False).stdout.strip() or "sha1"
+    files = {}
+    for item in git(repo, "ls-tree", "-r", "-z", "--full-tree", head).stdout.split("\0"):
+        meta, _, path = item.partition("\t")
+        fields = meta.split()
+        if len(fields) == 3 and fields[1] == "blob" and fields[0] in ("100644", "100755"):
+            files[path] = fields[2]
+    return {"head": head, "object_format": fmt, "files": files}
+
+
+def blob_id(data: bytes, fmt: str) -> str:
+    h = hashlib.new(fmt)
+    h.update(b"blob %d\0" % len(data))
+    h.update(data)
+    return h.hexdigest()
+
+
+def tree_differences(tree: str, manifest: dict) -> list[str]:
+    """The head's files the tree lacks or holds with other content. A file written with CRLF line ends (a checkout or
+    export with core.autocrlf) counts as the same; files the head does not have are not looked at."""
+    fmt = manifest["object_format"]
+    out = []
+    for path, blob in sorted(manifest["files"].items()):
+        try:
+            with open(os.path.join(tree, *path.split("/")), "rb") as f:
+                data = f.read()
+        except OSError:
+            out.append(f"{path} (missing)")
+            continue
+        if blob_id(data, fmt) == blob:
+            continue
+        if b"\r\n" in data and blob_id(data.replace(b"\r\n", b"\n"), fmt) == blob:
+            continue
+        out.append(f"{path} (differs)")
+    return out
+
+
+def verify_tree(matrix_dir: str, entry: dict, tree: str) -> None:
+    """Stop unless tree holds the set's head, so a result is never filed under a head it was not built from."""
+    path = os.path.join(matrix_dir, entry["name"], FILES)
+    if not os.path.isfile(path):
+        raise MatrixError(f"no {FILES} for set {entry['name']!r}: merge again (an older boot_matrix wrote this matrix)")
+    manifest = read_json(path)
+    if manifest.get("head") != entry["head"]:
+        raise MatrixError(f"{path} is for another head than the set's {entry['head'][:12]}: merge again")
+    differences = tree_differences(tree, manifest)
+    if differences:
+        shown = ", ".join(differences[:SHOWN_LIMIT])
+        if len(differences) > SHOWN_LIMIT:
+            shown += f" and {len(differences) - SHOWN_LIMIT} more"
+        raise MatrixError(f"{tree} is not set {entry['name']}'s head {entry['head'][:12]} ({shown}); check out or "
+                          f"export {entry['branch']} there")
+
+
 # --- merge ---------------------------------------------------------------------------------------------------------
 
 def merge_set(repo: str, base: str, name: str, prs: list[dict], checks: dict, env: dict) -> dict:
@@ -231,6 +300,9 @@ def cmd_merge(a: argparse.Namespace) -> int:
     matrix = {"tool": "boot_matrix", "version": 1, "base": {"ref": a.base, "sha": base},
               "sets": [merge_set(repo, base, name, prs, checks, env) for name, prs in sets.items()]}
     os.makedirs(a.out, exist_ok=True)
+    for s in matrix["sets"]:
+        os.makedirs(os.path.join(a.out, s["name"]), exist_ok=True)
+        write_json(os.path.join(a.out, s["name"], FILES), head_files(repo, s["head"]))
     write_json(os.path.join(a.out, MATRIX), matrix)
     for s in matrix["sets"]:
         merged = sum(1 for p in s["prs"] if p["status"] == "merged")
@@ -341,17 +413,22 @@ def boot(command: list[str], run_dir: str, env: dict, timeout: float) -> dict:
             "seconds": round(time.monotonic() - started, 1), "trace": trace, "d3d12": d3d12}
 
 
-def last_d3d12_call(path: str) -> str | None:
+def last_d3d12_call(path: str) -> tuple[str | None, str | None]:
+    """The last D3D12 trace line whole (`#N Method arguments result`, kept in result.json) and without its
+    arguments (`#N Method result`, what a report shows)."""
     last = None
     try:
         with boot_trace._open_text(path) as fh:
             for line in fh:
                 m = boot_trace.D3D12_LINE.match(line.rstrip("\n"))
                 if m:
-                    last = f"#{m.group(1)} {m.group(2)} {m.group(3)}"
+                    last = m
     except boot_trace.TraceError:
-        return None
-    return last
+        return None, None
+    if last is None:
+        return None, None
+    seq, call, outcome = last.groups()
+    return f"#{seq} {call} {outcome}", f"#{seq} {call.split()[0]} {outcome}"
 
 
 def classify(startup: dict | None, timed_out: bool, returncode: int | None) -> dict:
@@ -383,8 +460,9 @@ def summarize_run(outcome: dict) -> dict:
         calls = boot_trace.parse_d3d12(outcome["d3d12"])["calls"]
     except boot_trace.TraceError:
         calls = 0
+    last, method = last_d3d12_call(outcome["d3d12"])
     return {"stop": classify(startup, outcome["timed_out"], outcome["returncode"]), "d3d12_calls": calls,
-            "last_d3d12_call": last_d3d12_call(outcome["d3d12"]), "seconds": outcome["seconds"]}
+            "last_d3d12_call": last, "last_d3d12_method": method, "seconds": outcome["seconds"]}
 
 
 def cmd_run(a: argparse.Namespace) -> int:
@@ -392,11 +470,12 @@ def cmd_run(a: argparse.Namespace) -> int:
     matrix = read_json(os.path.join(a.matrix, MATRIX))
     entry = find_set(matrix, a.set)
     tree = os.path.abspath(a.tree)
+    verify_tree(a.matrix, entry, tree)
     tree_digest = digest_of_tree(tree)
     run_dir = next_run_dir(os.path.join(a.matrix, a.set))
     result = {"set": a.set, "head": entry["head"], "run": os.path.basename(run_dir),
               "translator_matches_set": tree_digest == entry["translation_digest"],
-              "shaders": shader_library_state(a.shaders, tree_digest), "build": "skipped"}
+              "shaders": shader_library_state(a.shaders, tree_digest), "build": PREBUILT}
     gta6rt = a.gta6rt
     if a.build:
         ok, built = build_runtime(tree, os.path.join(run_dir, "build.log"), a.config, a.cmake_arg)
@@ -428,17 +507,15 @@ def cmd_run(a: argparse.Namespace) -> int:
 # --- report --------------------------------------------------------------------------------------------------------
 
 def format_stop(stop: dict) -> str:
+    """One line for a stop, without the access address or the loader's message (both stay in result.json)."""
     kind = stop["kind"]
     if kind == "exit":
         return f"exit {stop['code']}"
     if kind == "last exception":
         text = f"last exception {stop['code']} at {stop['at']}"
-        if stop.get("access"):
-            text += f" ({stop['access']}" + (f" {stop['address']}" if stop.get("address") else "") + ")"
-        return text
+        return text + (f" ({stop['access']})" if stop.get("access") else "")
     if kind == "error":
-        what = " ".join(str(stop["what"]).split())
-        return "error: " + (what[:CELL_LIMIT] + "..." if len(what) > CELL_LIMIT else what)
+        return "error (the loader's message is in result.json)"
     if stop.get("returncode") is not None:
         return f"{kind} (process exit {stop['returncode']})"
     return kind
@@ -471,11 +548,22 @@ def pr_cell(prs: list[dict], status: str) -> str:
     return " ".join(f"#{p['pr']}" for p in prs if p["status"] == status) or "-"
 
 
+def shareable(result: dict | None) -> dict | None:
+    """The fields of a result that a report passes on (SHARED_RESULT, and SHARED_STOP of its stop)."""
+    if result is None:
+        return None
+    out = {key: result[key] for key in SHARED_RESULT if key in result}
+    if "stop" in result:
+        out["stop"] = {key: value for key, value in result["stop"].items() if key in SHARED_STOP}
+    return out
+
+
 def report_rows(matrix_dir: str) -> tuple[dict, list[dict]]:
     matrix = read_json(os.path.join(matrix_dir, MATRIX))
     rows = []
     for s in matrix["sets"]:
-        rows.append({"set": s["name"], "head": s["head"], "prs": s["prs"], "result": latest_result(matrix_dir, s["name"], s["head"])})
+        result = shareable(latest_result(matrix_dir, s["name"], s["head"]))
+        rows.append({"set": s["name"], "head": s["head"], "prs": s["prs"], "result": result})
     return matrix, rows
 
 
@@ -489,7 +577,7 @@ def format_markdown(matrix: dict, rows: list[dict]) -> str:
         if r is None:
             run = ["not run"] + ["-"] * 4
         else:
-            last = f"`{r['last_d3d12_call']}`" if r.get("last_d3d12_call") else "-"
+            last = f"`{r['last_d3d12_method']}`" if r.get("last_d3d12_method") else "-"
             stop = format_stop(r["stop"]) if "stop" in r else "-"
             run = [r["build"], r["shaders"], str(r.get("d3d12_calls", "-")), last, stop]
         cells = [row["set"], f"`{row['head'][:12]}`", pr_cell(row["prs"], "merged"), skipped, *run]
@@ -533,7 +621,7 @@ def build_parser() -> argparse.ArgumentParser:
     r = sub.add_parser("run", help="build and boot one set's tree")
     r.add_argument("matrix", help="the matrix folder written by merge")
     r.add_argument("--set", required=True, help="the set's name")
-    r.add_argument("--tree", required=True, help="a checkout or export of the set's branch")
+    r.add_argument("--tree", required=True, help="a checkout or export of the set's branch (checked against its head)")
     r.add_argument("--exe", required=True, help="game_scarlett_master.exe")
     r.add_argument("--game-dir", required=True, help="the package folder")
     r.add_argument("--shaders", required=True, help="<work>/shaders/spirv, passed as LEONIDA_SHADERS")
@@ -542,7 +630,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--cmake-arg", action="append", default=[], metavar="ARG",
                    help="extra configure argument for --build, e.g. -GNinja or -DLEONIDA_VULKAN_HEADERS_FETCH=OFF "
                         "on a machine without network (repeatable; use --cmake-arg=-G... for a leading dash)")
-    r.add_argument("--gta6rt", help="an already built gta6rt.exe (instead of --build)")
+    r.add_argument("--gta6rt", help=f"an already built gta6rt.exe (instead of --build; recorded as {PREBUILT})")
     r.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help=f"seconds before the run is stopped "
                    f"({DEFAULT_TIMEOUT})")
     r.add_argument("--overlay", help="gta6rt's --overlay (default: a fresh <run folder>/overlay)")
