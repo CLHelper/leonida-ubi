@@ -33,9 +33,10 @@ reported stop does not reproduce.
 
 `report` prints a Markdown table (or `--json`) with the newest run of each set. Both carry only fields from a fixed
 list, so they can be shared: the stop's kind, exception code, module+RVA and access kind, counts, and the last D3D12
-call as its number, method and result. Left out: the access address, the loader's error message (it can name a path),
-the D3D12 call's arguments, and a location outside every known module (shown as `unmapped`). They stay in each
-run's `result.json` and traces on your machine (AGENTS.md, "No game data").
+call as its number, label and result (a label of the shape the runtime writes is shown whole; other text is cut to its
+first word). Left out: the access address, the loader's error message (it can name a path), anything after the first
+word of a label that has not that shape, and a location outside every known module (shown as `unmapped`). They stay
+in each run's `result.json` and traces on your machine (AGENTS.md, "No game data").
 
 What a row says: `exit N` (the entry point returned), `running at timeout` (still going when stopped), `last
 exception CODE at SITE` (the process ended without an exit event; exceptions are recorded before handlers run, so
@@ -85,6 +86,9 @@ SHARED_STOP = ("kind", "code", "at", "access", "exceptions", "unimplemented", "r
 # A location a report may show: module+RVA, as the trace names it (`shims::module_offset`, also `host:<dll>+0x..`).
 # An address outside every known module comes as a bare absolute address; a report says `unmapped` instead.
 MODULE_SITE = re.compile(r"^(?:host:)?[^\s+\\/:]+\+0x[0-9a-fA-F]+$")   # a file name, never a path
+# The labels the runtime writes in `[d3d12-trace]` lines: one or two identifier words and an optional
+# `(device slot N)`. Checked against every label of three world-start runs (43 distinct).
+D3D12_LABEL = re.compile(r"^[A-Za-z_][\w:]*(?: [A-Za-z_][\w:]*)?(?: \(device slot \d+\))?$")
 
 
 class MatrixError(Exception):
@@ -417,9 +421,17 @@ def boot(command: list[str], run_dir: str, env: dict, timeout: float) -> dict:
             "seconds": round(time.monotonic() - started, 1), "trace": trace, "d3d12": d3d12}
 
 
+def shared_call(call: str) -> str:
+    """A trace line's call label as a report may show it. The runtime writes fixed labels (`d3d12_trace.h`):
+    `ID3D12Device::CreateCommittedResource`, `XboxIDXGIDevice::GetAdapter`, `Xbox CreatePlacedResourceX (device
+    slot 133)`. One of that shape is shown whole; anything else (text a label never has, such as arguments or a
+    path) is cut to its first word."""
+    return call if D3D12_LABEL.match(call) else call.split()[0]
+
+
 def last_d3d12_call(path: str) -> tuple[str | None, str | None]:
-    """The last D3D12 trace line whole (`#N Method arguments result`, kept in result.json) and without its
-    arguments (`#N Method result`, what a report shows)."""
+    """The last D3D12 trace line whole (`#N label result`, kept in result.json) and as a report shows it
+    (`#N label result` with the label passed through `shared_call`)."""
     last = None
     try:
         with boot_trace._open_text(path) as fh:
@@ -432,7 +444,7 @@ def last_d3d12_call(path: str) -> tuple[str | None, str | None]:
     if last is None:
         return None, None
     seq, call, outcome = last.groups()
-    return f"#{seq} {call} {outcome}", f"#{seq} {call.split()[0]} {outcome}"
+    return f"#{seq} {call} {outcome}", f"#{seq} {shared_call(call)} {outcome}"
 
 
 def classify(startup: dict | None, timed_out: bool, returncode: int | None) -> dict:

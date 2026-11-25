@@ -410,6 +410,26 @@ class ClassifyTest(unittest.TestCase):
         stop = bm.classify(self.startup(exception_count=1, exceptions=[exc], error="bad image"), False, 1)
         self.assertEqual(stop["kind"], "error")
 
+    def test_shared_calls_keep_real_labels_whole(self):
+        for call, want in (("ID3D12Device::CreateCommittedResource", "ID3D12Device::CreateCommittedResource"),
+                           ("XboxIDXGIDevice::GetAdapter", "XboxIDXGIDevice::GetAdapter"),
+                           ("Xbox CreatePlacedResourceX (device slot 133)",
+                            "Xbox CreatePlacedResourceX (device slot 133)"),
+                           ("ExecuteCommandLists count=1 queue=0x7ff6a0b0", "ExecuteCommandLists"),
+                           (r"CreateFoo C:\x\y", "CreateFoo")):
+            with self.subTest(call=call):
+                self.assertEqual(bm.shared_call(call), want)
+
+    def test_last_call_of_a_slot_label(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "d3d12.log")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write("[d3d12-trace] #1 ID3D12Device::CreateFence ok\n"
+                        "[d3d12-trace] #2 Xbox CreatePlacedResourceX (device slot 133) failed\n")
+            self.assertEqual(bm.last_d3d12_call(path),
+                             ("#2 Xbox CreatePlacedResourceX (device slot 133) failed",
+                              "#2 Xbox CreatePlacedResourceX (device slot 133) failed"))
+
     def test_shared_sites(self):
         for at, want in (("title.exe+0x4fb0aec", "title.exe+0x4fb0aec"),
                          ("host:ntdll.dll+0x9f3a2", "host:ntdll.dll+0x9f3a2"),
