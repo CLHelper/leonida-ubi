@@ -38,6 +38,9 @@ FAKE_GTA6RT = textwrap.dedent('''\
     if mode == "crash":
         events.append({"kind": "exception", "code": "0xc0000005", "at": "title.exe+0x4fb0aec",
                        "access": "read", "address": "0xffffffffffffffff"})
+    if mode == "crash-unmapped":   # an instruction pointer outside every known module: a bare address
+        events.append({"kind": "exception", "code": "0xc0000005", "at": "0x7ff6a0b0c0d0",
+                       "access": "execute", "address": "0x7ff6a0b0c0d0"})
     with open(trace, "w", encoding="utf-8") as f:
         for e in events:
             f.write(json.dumps(e) + "\\n")
@@ -52,7 +55,7 @@ FAKE_GTA6RT = textwrap.dedent('''\
         elif mode == "hang":
             f.flush()
             time.sleep(60)
-    sys.exit(3 if mode == "crash" else 0)
+    sys.exit(3 if mode.startswith("crash") else 0)
     ''')
 
 
@@ -361,6 +364,18 @@ class RunTest(RepoCase):
                 self.assertNotIn("0xffffffffffffffff", text)
                 self.assertNotIn("queue=0x7ff6a0b0", text)
 
+    def test_report_names_a_location_outside_every_module_unmapped(self):
+        result, _ = self.run_set("crash-unmapped")
+        self.assertEqual(result["stop"]["at"], "0x7ff6a0b0c0d0")   # kept in result.json
+        matrix, rows = bm.report_rows(self.out)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(bm.main(["report", self.out, "--json"]), 0)
+        for text in (bm.format_markdown(matrix, rows), out.getvalue()):
+            with self.subTest(text=text[:40]):
+                self.assertNotIn("7ff6a0b0c0d0", text)
+                self.assertIn("unmapped", text)
+
     def test_relative_matrix_folder(self):
         """gta6rt runs in the run folder, so a relative matrix path must not reach it as a relative trace path."""
         cwd = os.getcwd()
@@ -394,6 +409,14 @@ class ClassifyTest(unittest.TestCase):
         exc = {"code": "0x406d1388", "at": "title.exe+0x10"}
         stop = bm.classify(self.startup(exception_count=1, exceptions=[exc], error="bad image"), False, 1)
         self.assertEqual(stop["kind"], "error")
+
+    def test_shared_sites(self):
+        for at, want in (("title.exe+0x4fb0aec", "title.exe+0x4fb0aec"),
+                         ("host:ntdll.dll+0x9f3a2", "host:ntdll.dll+0x9f3a2"),
+                         ("0x7ff6a0b0c0d0", "unmapped"), ("", "unmapped"), (None, "unmapped"),
+                         (r"C:\x\title.exe+0x10", "unmapped"), ("dir/title.exe+0x10", "unmapped")):
+            with self.subTest(at=at):
+                self.assertEqual(bm.shared_site(at), want)
 
     def test_loader_message_stays_out_of_the_report(self):
         path = "C:\\Users\\someone\\games\\pkg\\title.exe"

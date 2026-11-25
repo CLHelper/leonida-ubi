@@ -243,8 +243,9 @@ python -I tools\boot_matrix.py report $matrix
   not reproduce.
 * `report` prints the Markdown table (or `--json`), with the newest run of each set's current head. Both pass on
   only a fixed list of fields: the stop's kind, exception code, module+RVA and access kind, the counts, and the last
-  D3D12 call as number, method and result. The access address, the loader's error message (it can name a path) and
-  the call's arguments stay in `result.json` on your machine. A `last exception` row is the last exception the trace
+  D3D12 call as number, method and result. The access address, the loader's error message (it can name a path), the
+  call's arguments and a location outside every known module (the report says `unmapped`) stay in `result.json` on
+  your machine. A `last exception` row is the last exception the trace
   recorded before the process ended; exceptions are logged before handlers run, so it is where to look first, not
   proof of the cause.
 

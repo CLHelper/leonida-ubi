@@ -23,18 +23,19 @@ machine, a separate user), and point `--tree` at it. The tree must hold the set'
 every file of that head to `<out>/<set>/files.json`, and `run` stops (exit 2) when a file is missing from the tree or
 differs from it (CRLF line ends aside; files the head does not have, such as a build folder, are ignored). With
 `--build` it configures and builds `runtime/` there; else `--gta6rt` names the executable, and the run is recorded as
-built `prebuilt (unverified)`: nothing shows which source that binary came from. It runs `gta6rt --run --trace --trace-d3d12` with `LEONIDA_D3D12=vulkan` and
-`LEONIDA_SHADERS`, stops the process tree at `--timeout`, and writes `<out>/<set>/runN/result.json`: the stop, the
-D3D12 call count and last call (summarised with `tools/boot_trace.py`), and whether the shader library was
-translated by this tree's translator (`translation_sources.sha256` that `make_game.py` writes beside it, against
-the same digest over the tree's `TRANSLATION_SOURCES`). A library from another translator is the usual reason a
+built `prebuilt (unverified)`: nothing shows which source that binary came from. It runs
+`gta6rt --run --trace --trace-d3d12` with `LEONIDA_D3D12=vulkan` and `LEONIDA_SHADERS`, stops the process tree at
+`--timeout`, and writes `<out>/<set>/runN/result.json`: the stop, the D3D12 call count and last call (summarised
+with `tools/boot_trace.py`), and whether the shader library was translated by this tree's translator
+(`translation_sources.sha256` that `make_game.py` writes beside it, against the same digest over the tree's
+`TRANSLATION_SOURCES`). A library from another translator is the usual reason a
 reported stop does not reproduce.
 
 `report` prints a Markdown table (or `--json`) with the newest run of each set. Both carry only fields from a fixed
 list, so they can be shared: the stop's kind, exception code, module+RVA and access kind, counts, and the last D3D12
-call as its number, method and result. Left out: the access address, the loader's error message (it can name a path)
-and the D3D12 call's arguments. They stay in each run's `result.json` and traces on your machine (AGENTS.md, "No
-game data").
+call as its number, method and result. Left out: the access address, the loader's error message (it can name a path),
+the D3D12 call's arguments, and a location outside every known module (shown as `unmapped`). They stay in each
+run's `result.json` and traces on your machine (AGENTS.md, "No game data").
 
 What a row says: `exit N` (the entry point returned), `running at timeout` (still going when stopped), `last
 exception CODE at SITE` (the process ended without an exit event; exceptions are recorded before handlers run, so
@@ -81,6 +82,9 @@ PREBUILT = "prebuilt (unverified)"
 SHARED_RESULT = ("run", "head", "build", "shaders", "translator_matches_set", "d3d12_calls", "last_d3d12_method",
                  "seconds")
 SHARED_STOP = ("kind", "code", "at", "access", "exceptions", "unimplemented", "returncode")
+# A location a report may show: module+RVA, as the trace names it (`shims::module_offset`, also `host:<dll>+0x..`).
+# An address outside every known module comes as a bare absolute address; a report says `unmapped` instead.
+MODULE_SITE = re.compile(r"^(?:host:)?[^\s+\\/:]+\+0x[0-9a-fA-F]+$")   # a file name, never a path
 
 
 class MatrixError(Exception):
@@ -555,7 +559,14 @@ def shareable(result: dict | None) -> dict | None:
     out = {key: result[key] for key in SHARED_RESULT if key in result}
     if "stop" in result:
         out["stop"] = {key: value for key, value in result["stop"].items() if key in SHARED_STOP}
+        if "at" in out["stop"]:
+            out["stop"]["at"] = shared_site(out["stop"]["at"])
     return out
+
+
+def shared_site(at: object) -> str:
+    """A trace location as a report may show it: module+RVA as it is, anything else (a bare address) `unmapped`."""
+    return at if isinstance(at, str) and MODULE_SITE.match(at) else "unmapped"
 
 
 def report_rows(matrix_dir: str) -> tuple[dict, list[dict]]:
