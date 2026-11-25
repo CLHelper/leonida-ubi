@@ -146,6 +146,53 @@ class PipelineBatchesTest(unittest.TestCase):
         rows = [json.loads(line) for line in (bvh / "calls.jsonl").read_text(encoding="utf-8").splitlines()]
         self.assertEqual([row["selected"] for row in rows if row["event"] == "completed"], [["b_0"]])
 
+    def add_set(self, folder, names, control=None):
+        """A translated set in its own folder under spirv/, as the bvh and library stages write them."""
+        path = self.spirv / folder
+        path.mkdir()
+        (path / "index.json").write_text(json.dumps({n: {} for n in names}), encoding="utf-8")
+        (path / "control.json").write_text(json.dumps(control or {}), encoding="utf-8")
+        return path
+
+    def completed_in(self, path):
+        rows = [json.loads(line) for line in (path / "calls.jsonl").read_text(encoding="utf-8").splitlines()]
+        return [row["selected"] for row in rows if row["event"] == "completed"]
+
+    def test_library_pipelines_are_added_to_the_runtime_seed_after_the_bvh_ones(self):
+        bvh = self.add_set("bvh", ["b_0"])
+        library = self.add_set("library", ["lib_cs_00001", "lib_cs_00000"])
+        code, logs, err = self.invoke()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads((self.out / "pipeline_cache.bin").read_text(encoding="utf-8")),
+                         self.names + ["b_0", "lib_cs_00000", "lib_cs_00001"])
+        self.assertEqual(self.completed_in(bvh), [["b_0"]])
+        self.assertEqual(self.completed_in(library), [["lib_cs_00000", "lib_cs_00001"]])
+        library_call = next(c for c in self.commands if c[1] == str(library))
+        self.assertEqual(library_call[2], str(self.out / "pipeline_cache.bin"))
+        self.assertEqual(library_call[library_call.index("--jobs") + 1], "2")
+        self.assertIn("pipelines: done", logs)
+
+    def test_library_seed_without_bvh_or_range_support(self):
+        library = self.add_set("library", ["lib_cs_00000"])
+        code, _, err = self.invoke(range_support=False)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.completed_in(library), [["lib_cs_00000"]])
+
+    def test_a_failed_library_seed_keeps_the_stage_and_says_so(self):
+        library = self.add_set("library", ["lib_cs_00000"], {"crash_before_work": True})
+        code, logs, err = self.invoke()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads((self.out / "pipeline_cache.bin").read_text(encoding="utf-8")), self.names)
+        self.assertTrue(any("WARNING" in line and "library" in line for line in logs), logs)
+        self.assertIn("pipelines: done", logs)
+        self.assertFalse((library / "calls.jsonl").read_text(encoding="utf-8").count('"completed"'))
+
+    def test_interrupting_the_library_seed_stops_the_stage(self):
+        self.add_set("library", ["lib_cs_00000"], {"interrupt": True})
+        code, logs, _ = self.invoke()
+        self.assertNotEqual(code, 0)
+        self.assertNotIn("pipelines: done", logs)
+
     def test_collective_memory_crash_splits_without_skipping_healthy_modules(self):
         code, logs, err = self.invoke({"max_batch": 2})
         self.assertEqual(code, 0, err)

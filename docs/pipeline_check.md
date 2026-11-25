@@ -359,6 +359,18 @@ smaller processes, down to one entry; healthy modules are not added to the crash
 an interrupted check or a setup error stops the stage. A validation failure in one batch remains a failure even
 when subsequent batches succeed; it does not prevent those later batches from being checked.
 
+### The sets in their own folders
+
+The checker reads one folder's `index.json`, so the sets the shaders stage writes beside the main corpus are added
+to the same `pipeline_cache.bin` after it, one invocation each: `spirv/bvh` (the XboxBvhBuilder compute programs),
+then `spirv/library` (the shader library's compute programs, `lib_cs_*`). A folder without an index is skipped.
+Without the library in the seed, the runtime builds each `lib_cs_*` program inline when a submission first needs
+it, 2-5 s each for the large ones at the world start. The library holds the largest modules of the pack, so a
+failed library invocation is a warning, not a stage failure: the seed keeps what the checker saved (it keeps what
+it built when an entry fails, and saves every ten minutes while it runs) and the runtime builds the rest as before.
+Ctrl+C there still stops the stage. Whether the runtime's device then hits these entries is the question in
+[The cache and the runtime's device](#the-cache-and-the-runtimes-device).
+
 The native checker returns 1 for initialization failures as well as validation failures. A completed shader pass
 writes/clears its in-flight report even when validation fails. Exit 1 without a new report stops the stage instead
 of repeating failed setup for the remaining batches; diagnostic probes use the same distinction. Each process

@@ -2671,12 +2671,27 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
     jobs_args = ["--jobs", str(jobs)] if jobs else []
     base = [exe, spirv, cache, *jobs_args]
 
-    def seed_bvh() -> None:
+    def seed_folders() -> None:
+        """The translated sets in their own folders, added to the same seed: the BVH builder, then the shader
+        library. The runtime builds a library compute program (lib_cs_*) when a submission first needs it, inline,
+        and at the world start that is a run of 2-5 s compiles while the GPU idles. The library holds the largest
+        modules of the pack, so a failure there keeps the seed as far as it got (the checker keeps what it built when
+        an entry fails, and saves every ten minutes while it runs) and the runtime builds the rest as before, instead
+        of failing a stage whose main corpus passed."""
         bvh = os.path.join(spirv, "bvh")
-        if not os.path.isfile(os.path.join(bvh, "index.json")):
+        if os.path.isfile(os.path.join(bvh, "index.json")):
+            log("pipelines: creating XboxBvhBuilder compute pipelines")
+            run([exe, bvh, cache, *jobs_args])
+        library = os.path.join(spirv, "library")
+        if not os.path.isfile(os.path.join(library, "index.json")):
             return
-        log("pipelines: creating XboxBvhBuilder compute pipelines")
-        run([exe, bvh, cache, *jobs_args])
+        log("pipelines: creating the shader library's compute pipelines")
+        code = run([exe, library, cache, *jobs_args], check=False)
+        if interrupted(code):
+            fail("pipelines: stopped while creating the shader library's compute pipelines")
+        if code:
+            log(f"pipelines: WARNING: the shader library's pipelines stopped with {exit_label(code)}; the seed keeps "
+                "what was created, and the runtime builds the rest when it first needs them")
 
     if not checker_supports(exe, "--inflight-file", "--skip-file"):
         # An older build takes any argument it doesn't know as the cache path, so it would write the cache into
@@ -2684,7 +2699,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
         log("pipelines: this vk_pipeline_check has no --inflight-file; rebuild the runtime stage so a module that "
             "crashes the driver is skipped instead of stopping the stage")
         run(base)
-        seed_bvh()
+        seed_folders()
         log("pipelines: done")
         return
     base += ["--inflight-file", inflight]
@@ -2760,7 +2775,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
         why = f"; {len(crashed)} module(s) took the driver down and were counted as failed (with their SPIR-V " \
               f"hashes in pipeline_crashes.json): " + ", ".join(crashed) if crashed else ""
         fail(f"vk_pipeline_check exited with {exit_label(code)}{why}")
-    seed_bvh()
+    seed_folders()
     log("pipelines: done")
 
 
