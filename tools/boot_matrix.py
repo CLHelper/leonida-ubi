@@ -14,16 +14,21 @@ tool makes that explicit in three steps:
 the result so far with `git merge-tree --write-tree` and `git commit-tree`: no checkout, no hooks, the working tree is
 not touched. A PR that `scripts/merge_check.py` finds already on the base (`already-merged`, the case where a stop
 was fixed by a merge the stack predates) is skipped, and one that conflicts with the PRs before it is skipped with
-its conflicted files listed. The result is the branch `boot-matrix/<set>` and `<out>/matrix.json`. A PR spec is `N`
-(the ref `refs/boot-matrix/pr/N`, fetched from `pull/N/head` with `--fetch REMOTE`) or `N:REF` for a ref you have.
+its conflicted files listed. A PR merged and then reverted on the base is skipped as `already-merged` too: git merges
+an ancestor as a no-op, so such a set does not have the PR's code; revert the revert on a branch and give it as
+`N:REF` to test it. A set's branch that is checked out in the repository stops the merge before anything is
+written. The result is the branch `boot-matrix/<set>` and `<out>/matrix.json`. A PR spec is `N` (the ref
+`refs/boot-matrix/pr/N`, fetched from `pull/N/head` with `--fetch REMOTE`) or `N:REF` for a ref you have.
 The merge commits use a fixed author and the base's commit date, so the same inputs give the same commit.
 
 `run` builds and boots one set's tree: export or check out `boot-matrix/<set>` where you build PR code (another
 machine, a separate user), and point `--tree` at it. The tree must hold the set's head: `merge` writes the blob id of
 every file of that head to `<out>/<set>/files.json`, and `run` stops (exit 2) when a file is missing from the tree or
 differs from it (CRLF line ends aside; files the head does not have, such as a build folder, are ignored). With
-`--build` it configures and builds `runtime/` there; else `--gta6rt` names the executable, and the run is recorded as
-built `prebuilt (unverified)`: nothing shows which source that binary came from. It runs
+`--build` it configures and builds `runtime/` there, in a build folder of the head's own
+(`runtime/build-boot-matrix-<head>`), so a binary built for another set is never reused; else `--gta6rt` names the
+executable, and the run is recorded as built `prebuilt (unverified)`: nothing shows which source that binary came
+from. It runs
 `gta6rt --run --trace --trace-d3d12` with `LEONIDA_D3D12=vulkan` and `LEONIDA_SHADERS`, stops the process tree at
 `--timeout`, and writes `<out>/<set>/runN/result.json`: the stop, the D3D12 call count and last call (summarised
 with `tools/boot_trace.py`), and whether the shader library was translated by this tree's translator
@@ -32,11 +37,16 @@ with `tools/boot_trace.py`), and whether the shader library was translated by th
 reported stop does not reproduce.
 
 `report` prints a Markdown table (or `--json`) with the newest run of each set. Both carry only fields from a fixed
-list, so they can be shared: the stop's kind, exception code, module+RVA and access kind, counts, and the last D3D12
-call as its number, label and result (a label of the shape the runtime writes is shown whole; other text is cut to its
-first word). Left out: the access address, the loader's error message (it can name a path), anything after the first
-word of a label that has not that shape, and a location outside every known module (shown as `unmapped`). They stay
-in each run's `result.json` and traces on your machine (AGENTS.md, "No game data").
+list, each checked for the form it should have, so they can be shared: the base and each set's head as commits, the
+set names, each PR's number, status and why it was skipped, and of the run its build and shader state, the stop's kind,
+exit or exception code, module+RVA and access kind, counts, the run's options (`LEONIDA_*` variable names, others
+counted; timeout; whether `--overlay` was given), and the last D3D12 call as number, label and outcome. A label of
+the shape the runtime writes is shown whole, one with free text after its name is cut to the name, anything else is
+`(other)`; an outcome the runtime does not write is `other`, as are an exception code or access kind of another form.
+Left out: the refs given for the base and the PRs (they can name local branches), merge_check's verdicts, conflicted
+file names, the access address, the loader's error message (it can name a path), and a location outside every known
+module (shown as `unmapped`). They stay in matrix.json, each run's `result.json` and the traces on your machine
+(AGENTS.md, "No game data").
 
 What a row says: `exit N` (the entry point returned), `running at timeout` (still going when stopped), `last
 exception CODE at SITE` (the process ended without an exit event; exceptions are recorded before handlers run, so
@@ -44,7 +54,7 @@ the last one is where to look first, not proof of the cause), `error` (the loade
 `result.json`) or `no trace`.
 
 Standard library only; needs git 2.38 or newer for `merge-tree --write-tree`. Exit 0 on success, 1 when a set had a
-conflict or a run did not reach a trace, 2 on a usage, git or file error.
+conflict, a build failed or a run did not reach a trace, 2 on a usage, git or file error.
 """
 from __future__ import annotations
 
@@ -74,6 +84,8 @@ SHOWN_LIMIT = 5   # differing files named when a tree is refused
 PR_REF = "refs/boot-matrix/pr/{}"
 BRANCH = "boot-matrix/{}"
 SET_NAME = re.compile(r"^(?!.*\.\.)(?!.*\.lock$)[A-Za-z0-9][A-Za-z0-9._-]*(?<!\.)$")
+# A set's name is a folder: Windows refuses these device names (with any extension) as one.
+RESERVED_NAMES = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
 MERGE_AUTHOR = {"GIT_AUTHOR_NAME": "boot_matrix", "GIT_AUTHOR_EMAIL": "boot-matrix@invalid",
                 "GIT_COMMITTER_NAME": "boot_matrix", "GIT_COMMITTER_EMAIL": "boot-matrix@invalid"}
 DEFAULT_TIMEOUT = 600   # seconds; the retail boot reaches its frame loop well within this on a desktop GPU
@@ -81,7 +93,7 @@ TAIL_LINES = 20
 PREBUILT = "prebuilt (unverified)"
 # What `report` passes on from a result.json and from its stop; everything else stays on the machine.
 SHARED_RESULT = ("run", "head", "build", "shaders", "translator_matches_set", "d3d12_calls", "last_d3d12_method",
-                 "seconds")
+                 "seconds")   # and "options", reduced by shareable()
 SHARED_STOP = ("kind", "code", "at", "access", "exceptions", "unimplemented", "returncode")
 # A location a report may show: module+RVA, as the trace names it (`shims::module_offset`, also `host:<dll>+0x..`).
 # An address outside every known module comes as a bare absolute address; a report says `unmapped` instead.
@@ -89,6 +101,10 @@ MODULE_SITE = re.compile(r"^(?:host:)?[^\s+\\/:]+\+0x[0-9a-fA-F]+$")   # a file 
 # The labels the runtime writes in `[d3d12-trace]` lines: one or two identifier words and an optional
 # `(device slot N)`. Checked against every label of three world-start runs (43 distinct).
 D3D12_LABEL = re.compile(r"^[A-Za-z_][\w:]*(?: [A-Za-z_][\w:]*)?(?: \(device slot \d+\))?$")
+IDENTIFIER = re.compile(r"^[A-Za-z_][\w:]*$")
+EXCEPTION_CODE = re.compile(r"^0x[0-9a-fA-F]{1,8}$")
+ACCESS_KINDS = ("read", "write", "execute")
+PR_STATUSES = ("merged", "already-merged", "conflict")
 
 
 class MatrixError(Exception):
@@ -104,6 +120,8 @@ def parse_set(text: str) -> tuple[str, list[dict]]:
     name, sep, specs = text.partition("=")
     if not sep or not SET_NAME.match(name):
         raise argparse.ArgumentTypeError(f"expected NAME=PR[,PR...], got {text!r}")
+    if name.split(".")[0].lower() in RESERVED_NAMES:
+        raise argparse.ArgumentTypeError(f"set {name!r}: a name Windows keeps for a device cannot be a folder")
     if not specs:
         return name, []
     prs = []
@@ -259,6 +277,8 @@ def merge_set(repo: str, base: str, name: str, prs: list[dict], checks: dict, en
                "duplicates": sum(checks[pr["pr"]]["duplicates"].values()),
                "conflicts_with_base": checks[pr["pr"]]["conflict"], "conflict_files": []}
         if row["verdict"] == "already-merged":
+            # Its commits are on the base, so a merge would add nothing; that holds for a PR merged and then
+            # reverted on the base too (git merges an ancestor as a no-op), and such a set does not have its code.
             row["status"] = "already-merged"
             rows.append(row)
             continue
@@ -286,6 +306,12 @@ def cmd_merge(a: argparse.Namespace) -> int:
     sets = dict(a.set)
     if len({name.lower() for name in sets}) != len(a.set):
         raise MatrixError("two sets share a name (names are compared without case: they are folders too)")
+    # Before anything is written: a set's branch checked out here would move under its own working tree.
+    checked_out = git(repo, "symbolic-ref", "-q", "HEAD", check=False).stdout.strip()
+    for name in sets:
+        if checked_out == f"refs/heads/{BRANCH.format(name)}":
+            raise MatrixError(f"{BRANCH.format(name)} is checked out in {repo}: merging would move it under that "
+                              "working tree; check out another branch there first")
     numbers = sorted({p["pr"] for prs in sets.values() for p in prs if p["ref"] == PR_REF.format(p["pr"])})
     if a.fetch and numbers:
         fetch(repo, a.fetch, numbers)
@@ -362,9 +388,16 @@ def tail(path: str, lines: int = TAIL_LINES) -> list[str]:
         return []
 
 
-def build_runtime(tree: str, log_path: str, config: str, cmake_args: list[str]) -> tuple[bool, str | None]:
-    """Configure and build gta6rt (and the TLS host DLL it depends on) in <tree>/runtime/build."""
-    build = os.path.join(tree, "runtime", "build")
+def build_dir(tree: str, head: str) -> str:
+    """Where `run --build` builds a set's head: a folder of that head's own. An export of another set unpacked over
+    the same tree keeps the commit date of the base in every file, older than the objects already built, so a shared
+    build folder would hand back the earlier set's gta6rt.exe as built from this one."""
+    return os.path.join(tree, "runtime", f"build-boot-matrix-{head[:12]}")
+
+
+def build_runtime(tree: str, build: str, log_path: str, config: str,
+                  cmake_args: list[str]) -> tuple[bool, str | None]:
+    """Configure and build gta6rt (and the TLS host DLL it depends on) in `build`."""
     steps = (["cmake", "-S", os.path.join(tree, "runtime"), "-B", build, *cmake_args],
              ["cmake", "--build", build, "--config", config, "--target", "gta6rt"])
     with open(log_path, "w", encoding="utf-8", newline="\n") as log:
@@ -422,11 +455,19 @@ def boot(command: list[str], run_dir: str, env: dict, timeout: float) -> dict:
 
 
 def shared_call(call: str) -> str:
-    """A trace line's call label as a report may show it. The runtime writes fixed labels (`d3d12_trace.h`):
+    """A trace line's call label as a report may show it. Most labels are fixed names (`d3d12_trace.h`):
     `ID3D12Device::CreateCommittedResource`, `XboxIDXGIDevice::GetAdapter`, `Xbox CreatePlacedResourceX (device
-    slot 133)`. One of that shape is shown whole; anything else (text a label never has, such as arguments or a
-    path) is cut to its first word."""
-    return call if D3D12_LABEL.match(call) else call.split()[0]
+    slot 133)`; one of that shape is shown whole. Others carry free text after the name (`PipelineStream::Refused
+    <reason>`) and are cut to the name; text that does not start with a name at all is `(other)`."""
+    if D3D12_LABEL.match(call):
+        return call
+    words = call.split()
+    return words[0] if words and IDENTIFIER.match(words[0]) else "(other)"
+
+
+def shared_outcome(outcome: str) -> str:
+    """A trace line's outcome as a report may show it: one of the outcomes the runtime writes, else `other`."""
+    return outcome if outcome in boot_trace.D3D12_OUTCOMES else "other"
 
 
 def last_d3d12_call(path: str) -> tuple[str | None, str | None]:
@@ -444,7 +485,7 @@ def last_d3d12_call(path: str) -> tuple[str | None, str | None]:
     if last is None:
         return None, None
     seq, call, outcome = last.groups()
-    return f"#{seq} {call} {outcome}", f"#{seq} {shared_call(call)} {outcome}"
+    return f"#{seq} {call} {outcome}", f"#{seq} {shared_call(call)} {shared_outcome(outcome)}"
 
 
 def classify(startup: dict | None, timed_out: bool, returncode: int | None) -> dict:
@@ -491,10 +532,15 @@ def cmd_run(a: argparse.Namespace) -> int:
     run_dir = next_run_dir(os.path.join(a.matrix, a.set))
     result = {"set": a.set, "head": entry["head"], "run": os.path.basename(run_dir),
               "translator_matches_set": tree_digest == entry["translation_digest"],
-              "shaders": shader_library_state(a.shaders, tree_digest), "build": PREBUILT}
+              "shaders": shader_library_state(a.shaders, tree_digest), "build": PREBUILT,
+              # What else decides the stop, so two runs of a set can be told apart (variable names only).
+              "options": {"env": sorted(name for name, _ in a.env), "timeout": a.timeout,
+                          "overlay": "given" if a.overlay else "fresh", "config": a.config if a.build else None,
+                          "cmake_args": len(a.cmake_arg) if a.build else 0}}
     gta6rt = a.gta6rt
     if a.build:
-        ok, built = build_runtime(tree, os.path.join(run_dir, "build.log"), a.config, a.cmake_arg)
+        ok, built = build_runtime(tree, build_dir(tree, entry["head"]), os.path.join(run_dir, "build.log"),
+                                  a.config, a.cmake_arg)
         result["build"] = "ok" if ok and built else "failed"
         if result["build"] == "failed":
             result["build_tail"] = tail(os.path.join(run_dir, "build.log"))
@@ -504,7 +550,8 @@ def cmd_run(a: argparse.Namespace) -> int:
         gta6rt = built
     if not gta6rt or not os.path.isfile(gta6rt):
         raise MatrixError("give --build or --gta6rt <path to gta6rt.exe>")
-    # A fresh overlay and save folder per run: what an earlier run wrote must not change this boot.
+    # A fresh overlay (unless --overlay names one) and save folder per run: what an earlier run wrote must not change
+    # this boot.
     overlay = os.path.abspath(a.overlay) if a.overlay else os.path.join(run_dir, "overlay")
     save = os.path.join(run_dir, "save")
     os.makedirs(overlay, exist_ok=True)
@@ -570,10 +617,43 @@ def shareable(result: dict | None) -> dict | None:
         return None
     out = {key: result[key] for key in SHARED_RESULT if key in result}
     if "stop" in result:
-        out["stop"] = {key: value for key, value in result["stop"].items() if key in SHARED_STOP}
-        if "at" in out["stop"]:
-            out["stop"]["at"] = shared_site(out["stop"]["at"])
+        stop = {key: value for key, value in result["stop"].items() if key in SHARED_STOP}
+        if "at" in stop:
+            stop["at"] = shared_site(stop["at"])
+        if "code" in stop:   # an exit code (a number) or an exception code (hex); the trace's own text otherwise
+            code = stop["code"]
+            ok = (isinstance(code, int) and not isinstance(code, bool)) or (
+                isinstance(code, str) and EXCEPTION_CODE.match(code))
+            stop["code"] = code if ok else "other"
+        if "access" in stop and stop["access"] is not None and stop["access"] not in ACCESS_KINDS:
+            stop["access"] = "other"
+        for key in ("exceptions", "unimplemented", "returncode"):
+            if key in stop and not (stop[key] is None or (isinstance(stop[key], int) and
+                                                           not isinstance(stop[key], bool))):
+                stop[key] = "other"
+        out["stop"] = stop
+    if isinstance(result.get("options"), dict):
+        env = result["options"].get("env") or []
+        # Variable names only; a name of the runtime's own family as it is, others counted.
+        named = sorted(n for n in env if isinstance(n, str) and re.fullmatch(r"LEONIDA_[A-Z0-9_]+", n))
+        others = len(env) - len(named)
+        out["options"] = {"env": named + ([f"({others} other)"] if others else []),
+                          "timeout": result["options"].get("timeout"),
+                          "overlay": "given" if result["options"].get("overlay") == "given" else "fresh"}
     return out
+
+
+def shared_prs(prs: list[dict]) -> list[dict]:
+    """A set's PR rows as a report may show them: number, status and why it was skipped. The refs given for them
+    (`N:REF` can name a local branch), shas, merge_check's verdict and conflicted file names stay in matrix.json."""
+    rows = []
+    for p in prs:
+        status = p.get("status") if p.get("status") in PR_STATUSES else "other"
+        row = {"pr": p["pr"], "status": status}
+        if status != "merged":
+            row["skipped"] = skip_reason({**p, "status": status})
+        rows.append(row)
+    return rows
 
 
 def shared_site(at: object) -> str:
@@ -586,16 +666,17 @@ def report_rows(matrix_dir: str) -> tuple[dict, list[dict]]:
     rows = []
     for s in matrix["sets"]:
         result = shareable(latest_result(matrix_dir, s["name"], s["head"]))
-        rows.append({"set": s["name"], "head": s["head"], "prs": s["prs"], "result": result})
+        rows.append({"set": s["name"], "head": s["head"], "prs": shared_prs(s["prs"]), "result": result})
     return matrix, rows
 
 
 def format_markdown(matrix: dict, rows: list[dict]) -> str:
-    out = [f"Base `{matrix['base']['sha'][:12]}` ({matrix['base']['ref']}).", "",
+    # The base as its commit only: the ref given for it can name a local branch or remote.
+    out = [f"Base `{matrix['base']['sha'][:12]}`.", "",
            "| Set | Head | Merged | Skipped | Build | Shaders | D3D12 calls | Last D3D12 call | Stop |",
            "|---|---|---|---|---|---|---|---|---|"]
     for row in rows:
-        skipped = " ".join(f"#{p['pr']} ({skip_reason(p)})" for p in row["prs"] if p["status"] != "merged") or "-"
+        skipped = " ".join(f"#{p['pr']} ({p['skipped']})" for p in row["prs"] if p["status"] != "merged") or "-"
         r = row["result"]
         if r is None:
             run = ["not run"] + ["-"] * 4
@@ -611,7 +692,7 @@ def format_markdown(matrix: dict, rows: list[dict]) -> str:
 def cmd_report(a: argparse.Namespace) -> int:
     matrix, rows = report_rows(a.matrix)
     if a.json:
-        print(json.dumps({"base": matrix["base"], "rows": rows}, indent=1))
+        print(json.dumps({"base": {"sha": matrix["base"]["sha"]}, "rows": rows}, indent=1))
     else:
         print(format_markdown(matrix, rows))
     return 0
